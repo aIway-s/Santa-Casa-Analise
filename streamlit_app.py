@@ -361,7 +361,7 @@ with st.sidebar:
     st.markdown("### Indicador 8 (Manual)")
     manual_input = []
     
-    with st.expander(" :bookmark_tabs: Inserir Dados CCIH (IPCSL/CVC)", expanded=False):
+    with st.expander(":page_with_curl: Inserir Dados CCIH (IPCSL/CVC)", expanded=False):
         for m in meses_sel:
             st.markdown(f"**{m:02d}/{ano_sel}**")
             c1, c2 = st.columns(2)
@@ -370,7 +370,7 @@ with st.sidebar:
             manual_input.append((ano_sel, m, c, d))
 
 if st.button("Processar Dados", type="primary"):
-    with st.spinner("Baixando dados e calculando..."):
+    with st.spinner("Baixando dados do DATASUS e calculando... Isso pode demorar um pouco devido ao tamanho dos arquivos.."):
         df_final = processar_dados(ano_sel, meses_sel, uf_input, cnes_input)
         
         # Merge Manual
@@ -443,7 +443,7 @@ if st.button("Processar Dados", type="primary"):
         c8.metric("TMP Médica", f"{totais['tx_med']:.2f}d", f"Nota {totais['p_med']}")
 
         # Tabs
-        tab1, tab2, tab3 = st.tabs([":bar_chart: Gráficos Interativos", ":bookmark_tabs: Tabela de Dados", ":package: Exportar PDF"])
+        tab1, tab2, tab3 = st.tabs([":bar_chart: Gráficos Interativos", ":page_with_curl: Tabela de Dados", ":mailbox_with_mail: Exportar PDF"])
 
         with tab1:
             col1, col2 = st.columns(2)
@@ -490,7 +490,7 @@ if st.button("Processar Dados", type="primary"):
             st.write("Clique abaixo para baixar o relatório completo.")
             pdf_bytes = gerar_pdf_buffer(df_final, cnes_input, totais)
             st.download_button(
-                label="📄 Baixar Relatório PDF",
+                label=" :bookmark_tabs: Baixar Relatório PDF",
                 data=pdf_bytes,
                 file_name=f"relatorio_indicadores_{quad_sel}_{ano_sel}.pdf",
                 mime="application/pdf"
