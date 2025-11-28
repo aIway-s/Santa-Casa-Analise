@@ -9,16 +9,16 @@ from loguru import logger
 from pysus.ftp.databases.sih import SIH
 from pysus.ftp.databases.cnes import CNES
 
-# ===================== CONFIGURAÇÃO INICIAL =====================
+# ===================== CONFIGURAÇÃO DA PÁGINA =====================
 st.set_page_config(
-    page_title="Santa Casa de Formiga - Indicadores",
-    page_icon="🏥",
+    page_title="Santa Casa Analytics",
+    page_icon=":hospital:",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# TÍTULO AJUSTADO
-st.title("🏥 Santa Casa de Formiga - Análise dos Indicadores")
+# Título Principal
+st.title(":hospital: Santa Casa de Formiga - Análise dos Indicadores")
 st.markdown("---")
 
 # ===================== CONSTANTES DE LEITOS =====================
@@ -83,7 +83,7 @@ def pontuacao_infeccao(densidade):
 
 # ===================== PROCESSAMENTO (COM CACHE) =====================
 @st.cache_data(show_spinner=False)
-def processar_dados_sih_cnes(ano, meses, uf, cnes_filter):
+def processar_dados(ano, meses, uf, cnes_filter):
     cnes_db = CNES().load()
     sih = SIH().load()
     
@@ -124,6 +124,7 @@ def processar_dados_sih_cnes(ano, meses, uf, cnes_filter):
                     dict_cap_geral[f"{month}/{year}"] = 120 * dias_mes; dict_cap_uti_a[f"{month}/{year}"] = 0
                     dict_cap_uti_n[f"{month}/{year}"] = 0; dict_cap_uti_p[f"{month}/{year}"] = 0
         except:
+            # Fallback
             dict_cap_geral[f"{month}/{year}"] = 120 * dias_mes; dict_cap_uti_a[f"{month}/{year}"] = 0
             dict_cap_uti_n[f"{month}/{year}"] = 0; dict_cap_uti_p[f"{month}/{year}"] = 0
 
@@ -200,7 +201,7 @@ def processar_dados_sih_cnes(ano, meses, uf, cnes_filter):
                                         elif 1 <= idade < 14: dias_uti_p += dias
                                         else: dias_uti_a += dias
         except Exception as e:
-            logger.error(f"Erro processamento {month}/{year}: {e}")
+            logger.error(f"Erro processamento SIH {month}/{year}: {e}")
 
         # Consolidar
         cap_g = dict_cap_geral.get(f"{month}/{year}", 1)
@@ -221,10 +222,10 @@ def processar_dados_sih_cnes(ano, meses, uf, cnes_filter):
 
     return pd.DataFrame(stats_list)
 
-# ===================== PLOTAGEM (WEB E PDF) =====================
+# ===================== PLOTAGEM =====================
 def plot_indicador(ax, df, col_y, media, nota, meta, color_ok, title, ylabel="Taxa (%)", is_tmp=False, fixed_ylim=None, is_inf=False):
     x = df["periodo"]
-    y = df[col_y].fillna(0)
+    y = df[col_y].fillna(0) # Sanitização
     
     colors = []
     for val in y:
@@ -237,19 +238,29 @@ def plot_indicador(ax, df, col_y, media, nota, meta, color_ok, title, ylabel="Ta
     title_fmt = f"{title}\nMédia: {media:.2f}{unit} | Nota: {nota:.2f}"
     ax.set_title(title_fmt, fontweight='bold', fontsize=10)
     
+    # === CORREÇÃO CRÍTICA DE LIMITES ===
+    # Garante que max_val não seja NaN ou Inf
     max_val = max(y.max() if not y.empty else 0, media)
-    if not np.isfinite(max_val): max_val = 0
+    if not np.isfinite(max_val) or np.isnan(max_val):
+        max_val = 0
     
     if fixed_ylim:
         ax.set_ylim(fixed_ylim)
         limit = fixed_ylim[1]
     else:
-        limit = 10 if max_val <= 0 else (105 if (not is_tmp and not is_inf and max_val <= 100) else max_val * 1.35)
+        # Lógica de limite dinâmico seguro
+        if max_val <= 0:
+            limit = 10 
+        elif not is_tmp and not is_inf and max_val <= 100:
+            limit = 105
+        else:
+            limit = max_val * 1.35 # Margem generosa
         ax.set_ylim(0, limit)
         
     ax.grid(axis='y', linestyle='--', alpha=0.3)
     ax.axhline(media, color='blue', linestyle='--', label=f'Média ({media:.2f})')
     
+    # Meta
     if is_inf: lbl_meta = f"Meta (<={meta}‰)"
     elif is_tmp: lbl_meta = f"Meta (<{meta})"
     else: lbl_meta = f"Meta (>={meta}%)" if meta > 10 else f"Meta (<={meta:.2f}%)"
@@ -261,11 +272,15 @@ def plot_indicador(ax, df, col_y, media, nota, meta, color_ok, title, ylabel="Ta
 
     ax.legend(loc='lower right', fontsize='x-small')
     
+    # Labels
     for i, val in enumerate(y):
         txt = f"{val:.2f}"
         if not is_tmp: txt += "%" if not is_inf else "‰"
+        
         y_pos = val + (limit * 0.02)
         ax.text(i, y_pos, txt, ha='center', fontweight='bold', fontsize=9)
+        
+        # Alerta
         if not is_tmp and not is_inf and val > 100:
             y_pos_risk = val + (limit * 0.10)
             ax.text(i, y_pos_risk, "ALTO RISCO", ha='center', color='#7209b7', fontweight='bold', fontsize=8)
@@ -283,8 +298,8 @@ def gerar_pdf_buffer(df_stats, cnes_filter, totais):
         
         plot_indicador(axs1[0,0], df_stats, "tx_mort_m", totais['tx_mort'], totais['p_mort'], 3, '#2a9d8f', "1. Mortalidade Inst.", fixed_ylim=(0,10))
         plot_indicador(axs1[0,1], df_stats, "tx_ocup_m", totais['tx_ocup'], totais['p_ocup'], 80, '#2a9d8f', "2. Ocupação Geral (Sem UTI)")
-        plot_indicador(axs1[1,0], df_stats, "tmp_med_m", totais['tx_med'], totais['p_med'], 8, '#2a9d8f', "3. TMP Clínica Médica", is_tmp=True)
-        plot_indicador(axs1[1,1], df_stats, "tmp_cir_m", totais['tx_cir'], totais['p_cir'], 5, '#2a9d8f', "4. TMP Clínica Cirúrgica", is_tmp=True)
+        plot_indicador(axs1[1,0], df_stats, "tmp_med_m", totais['tx_med'], totais['p_med'], 8, '#2a9d8f', "3. TMP Clínica Médica", ylabel="Dias", is_tmp=True)
+        plot_indicador(axs1[1,1], df_stats, "tmp_cir_m", totais['tx_cir'], totais['p_cir'], 5, '#2a9d8f', "4. TMP Clínica Cirúrgica", ylabel="Dias", is_tmp=True)
         pdf.savefig(fig1); plt.close()
 
         # PAG 2 - UTI
@@ -317,7 +332,7 @@ def gerar_pdf_buffer(df_stats, cnes_filter, totais):
         ]
         
         total_pts = t['p_mort']+t['p_ocup']+t['p_med']+t['p_cir']+t['p_a']+t['p_n']+t['p_p']+t['p_inf']
-        data_table.append(["TOTAL GERAL", "", "", "", f"{total_pts:.2f} / 48"])
+        data_table.append(["TOTAL GERAL", "", "", "", f"{total_pts:.2f} / 50"])
 
         table = plt.table(cellText=data_table, colLabels=None, cellLoc='center', loc='center', bbox=[0.05, 0.2, 0.9, 0.6])
         table.auto_set_font_size(False); table.set_fontsize(11); table.scale(1, 2)
@@ -346,7 +361,7 @@ with st.sidebar:
     st.markdown("### Indicador 8 (Manual)")
     manual_input = []
     
-    with st.expander("📝 Inserir Dados CCIH (IPCSL/CVC)", expanded=False):
+    with st.expander(" :bookmark_tabs: Inserir Dados CCIH (IPCSL/CVC)", expanded=False):
         for m in meses_sel:
             st.markdown(f"**{m:02d}/{ano_sel}**")
             c1, c2 = st.columns(2)
@@ -354,9 +369,9 @@ with st.sidebar:
             d = c2.number_input(f"Dias CVC ({m})", 0, 5000, 0, key=f"d_{m}")
             manual_input.append((ano_sel, m, c, d))
 
-if st.button("🚀 Processar Dados", type="primary"):
-    with st.spinner("Baixando dados do DATASUS e calculando..."):
-        df_final = processar_dados_sih_cnes(ano_sel, meses_sel, uf_input, cnes_input)
+if st.button("Processar Dados", type="primary"):
+    with st.spinner("Baixando dados e calculando..."):
+        df_final = processar_dados(ano_sel, meses_sel, uf_input, cnes_input)
         
         # Merge Manual
         df_manual = pd.DataFrame(manual_input, columns=["ano", "mes", "casos_ipcs", "dias_cvc"])
@@ -410,13 +425,13 @@ if st.button("🚀 Processar Dados", type="primary"):
         
         total_pts = totais['p_mort']+totais['p_ocup']+totais['p_med']+totais['p_cir']+totais['p_a']+totais['p_n']+totais['p_p']+totais['p_inf']
 
-        # --- EXIBIÇÃO WEB (Metric Cards) ---
+        # --- EXIBIÇÃO WEB (Metric Cards & Tabs) ---
         st.success("Dados processados com sucesso!")
         
         # Resumo Executivo (Cards)
         st.markdown("### Resumo do Desempenho")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Pontuação Total", f"{total_pts} / 48", delta_color="normal")
+        c1.metric("Pontuação Total", f"{total_pts} / 50", delta_color="normal")
         c2.metric("Mortalidade", f"{totais['tx_mort']:.2f}%", f"Nota {totais['p_mort']}")
         c3.metric("Ocup. Geral", f"{totais['tx_ocup']:.2f}%", f"Nota {totais['p_ocup']}")
         c4.metric("Infecção CVC", f"{totais['tx_inf']:.2f}‰", f"Nota {totais['p_inf']}")
@@ -428,7 +443,7 @@ if st.button("🚀 Processar Dados", type="primary"):
         c8.metric("TMP Médica", f"{totais['tx_med']:.2f}d", f"Nota {totais['p_med']}")
 
         # Tabs
-        tab1, tab2, tab3 = st.tabs(["📊 Gráficos Interativos", "📋 Dados Detalhados", "📥 Exportar PDF"])
+        tab1, tab2, tab3 = st.tabs([":bar_chart: Gráficos Interativos", ":bookmark_tabs: Tabela de Dados", ":package: Exportar PDF"])
 
         with tab1:
             col1, col2 = st.columns(2)
