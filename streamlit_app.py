@@ -5,39 +5,17 @@ from matplotlib.backends.backend_pdf import PdfPages
 import calendar
 import io
 import numpy as np
-from loguru import logger
 from pysus.ftp.databases.sih import SIH
-from pysus.ftp.databases.cnes import CNES
 
-# ===================== CONFIGURAÇÃO INICIAL =====================
-st.set_page_config(
-    page_title="Gestao Hospitalar",
-    page_icon=":hospital:",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-st.title(":hospital: Santa Casa de Formiga - Analise dos Indicadores")
+# ===================== CONFIGURAÇÃO =====================
+st.set_page_config(page_title="Gestão Hospitalar - Auditoria Final", layout="wide")
+st.title("🏥 Painel de Indicadores - Auditoria (Filtro de Idade Corrigido)")
 st.markdown("---")
 
-# ===================== CONSTANTES =====================
-# Leitos para remover da conta Geral (Enfermaria)
-CODIGOS_REMOVE_GERAL = ['10', '74', '75', '76', '77', '78', '79', '80', '81', '82', '83', '85', '86', '95']
+# ===================== PARÂMETROS =====================
+CAPACIDADE_FIXA = {'geral': 89, 'uti_a': 17, 'uti_n': 9, 'uti_p': 1}
 
-# Denominadores (Capacidade CNES)
-CODIGOS_DENOM_ADULTO = ['10', '74', '75', '76'] 
-CODIGOS_DENOM_NEO = ['81', '82', '83', '91', '92'] # 81 incluso como Neo
-CODIGOS_DENOM_PED = ['77', '78', '79', '95']
-
-# Listas para Classificação via MARCA_UTI (RD)
-MARCA_ADULTO = ['74', '75', '76', '10']
-MARCA_NEO = ['80', '81', '82', '83', '91', '92'] # 80/81 aqui contam como Neo na sua regra
-MARCA_PED = ['77', '78', '79', '95']
-
-# Capacidades Padrão (Fallback)
-CAPACIDADE_PADRAO = {'geral': 100, 'uti_a': 31, 'uti_n': 9, 'uti_p': 1}
-
-# ===================== FUNÇÕES AUXILIARES =====================
+# ===================== AUXILIARES =====================
 def get_meses_quadrimestre(q):
     if q == "Q1 (Jan-Abr)": return [1, 2, 3, 4]
     if q == "Q2 (Mai-Ago)": return [5, 6, 7, 8]
@@ -45,464 +23,354 @@ def get_meses_quadrimestre(q):
     return []
 
 def encontrar_coluna(df, candidatos):
-    for col in candidatos:
-        if col in df.columns: return col
+    cols_upper = [c.upper().strip() for c in df.columns]
+    # Busca Exata
+    for termo in candidatos:
+        for i, col in enumerate(cols_upper):
+            if termo == col: return df.columns[i]
+    # Busca Parcial
+    for termo in candidatos:
+        for i, col in enumerate(cols_upper):
+            if termo in col: return df.columns[i]
     return None
 
 def get_days_in_month(year, month):
     return calendar.monthrange(year, month)[1]
 
 # --- PONTUAÇÃO ---
-def pontuacao_mortalidade(taxa):
-    if taxa <= 3: return 7
-    elif 3 < taxa < 6: return 4
-    elif 6 <= taxa <= 8: return 2
-    else: return 0
+def pontuacao_mortalidade(taxa): return 7 if taxa <= 3 else (4 if taxa < 6 else (2 if taxa <= 8 else 0))
+def pontuacao_ocupacao(taxa): return 7 if taxa >= 80 else (4 if taxa >= 65 else (2 if taxa >= 55 else 0))
+def pontuacao_tmp_medica(dias): return 6 if 0 < dias < 8 else (4 if 8 <= dias < 11 else (2 if 11 <= dias < 14 else 0))
+def pontuacao_tmp_cirurgica(dias): return 6 if 0 < dias < 5 else (4 if 5 <= dias < 7 else (2 if 7 <= dias < 9 else 0))
+def pontuacao_uti(taxa): return 6 if taxa >= 85 else (4 if taxa >= 70 else (2 if taxa >= 60 else 0))
+def pontuacao_infeccao(densidade): return 6 if densidade <= 2.0 else (4 if densidade <= 3.0 else (2 if densidade <= 5.0 else 0))
 
-def pontuacao_ocupacao(taxa):
-    if taxa >= 80: return 7
-    elif 65 <= taxa < 80: return 4
-    elif 55 <= taxa < 65: return 2
-    else: return 0
-
-def pontuacao_tmp_medica(dias):
-    if dias == 0: return 0
-    if dias < 8: return 6
-    elif 8 <= dias < 11: return 4
-    elif 11 <= dias < 14: return 2
-    else: return 0
-
-def pontuacao_tmp_cirurgica(dias):
-    if dias == 0: return 0
-    if dias < 5: return 6
-    elif 5 <= dias < 7: return 4
-    elif 7 <= dias < 9: return 2
-    else: return 0
-
-def pontuacao_uti(taxa):
-    if taxa >= 85: return 6
-    elif 70 <= taxa < 85: return 4
-    elif 60 <= taxa < 70: return 2
-    else: return 0
-
-def pontuacao_infeccao(densidade):
-    if densidade <= 2.0: return 6
-    elif 2.0 < densidade <= 3.0: return 4
-    elif 3.0 < densidade <= 5.0: return 2
-    else: return 0
-
-# ===================== PROCESSAMENTO (SEQUENCIAL SEGURO) =====================
+# ===================== PROCESSAMENTO =====================
 @st.cache_data(show_spinner=False)
-def processar_dados(ano, meses, uf, cnes_filter):
-    cnes_db = CNES().load()
+def processar_mes_unico(ano, month, uf, cnes_filter):
     sih_db = SIH().load()
+    year = ano
+    dias_mes = get_days_in_month(year, month)
     
-    dict_cap_geral = {}
-    dict_cap_uti_a = {}
-    dict_cap_uti_n = {}
-    dict_cap_uti_p = {}
+    # Capacidades
+    caps = {k: v * dias_mes for k, v in CAPACIDADE_FIXA.items()}
     
-    stats_list = []
+    # Inicializa
+    d = {k: 0 for k in ["saidas_tot", "obitos_tot", "dias_geral", "dias_med", "saidas_med", 
+                        "dias_cir", "saidas_cir", "dias_a", "dias_n", "dias_p"]}
+    d.update({'sp_columns': [], 'unique_atoprof': [], 'raw_unique_atoprof': [], 'unique_procrea': [], 'raw_unique_procrea': []})
+    d["mes"] = month
     
-    # --- FASE 1: CNES (CAPACIDADE) ---
-    for month in meses:
-        year = ano
-        dias_mes = get_days_in_month(year, month)
-        
-        l_geral = CAPACIDADE_PADRAO['geral']
-        l_a = CAPACIDADE_PADRAO['uti_a']
-        l_n = CAPACIDADE_PADRAO['uti_n']
-        l_p = CAPACIDADE_PADRAO['uti_p']
-
-        try:
-            files = cnes_db.get_files(group="LT", uf=uf, year=year, month=month)
-            if files:
-                df = cnes_db.download(files).to_dataframe()
-                cols = [c for c in df.columns if "CNES" in c.upper()]
-                if cols:
-                    cnes_col = cols[0]
-                    df[cnes_col] = df[cnes_col].astype(str).str.strip().str.zfill(7)
-                    df_hosp = df[df[cnes_col] == str(cnes_filter)].copy()
-                    
-                    if not df_hosp.empty and "CODLEITO" in df_hosp.columns:
-                        df_hosp["CODLEITO"] = df_hosp["CODLEITO"].astype(str).str.strip()
-                        col_qt = "QT_EXIST" if "QT_EXIST" in df_hosp.columns else "QT_SUS"
-                        df_hosp[col_qt] = pd.to_numeric(df_hosp[col_qt], errors='coerce').fillna(0)
-
-                        val_geral = df_hosp[~df_hosp["CODLEITO"].isin(CODIGOS_REMOVE_GERAL)][col_qt].sum()
-                        if val_geral > 0: l_geral = val_geral
-                        
-                        val_a = df_hosp[df_hosp["CODLEITO"].isin(CODIGOS_DENOM_ADULTO)][col_qt].sum()
-                        if val_a > 0: l_a = val_a
-                        
-                        val_n = df_hosp[df_hosp["CODLEITO"].isin(CODIGOS_DENOM_NEO)][col_qt].sum()
-                        if val_n > 0: l_n = val_n
-                        
-                        val_p = df_hosp[df_hosp["CODLEITO"].isin(CODIGOS_DENOM_PED)][col_qt].sum()
-                        if val_p > 0: l_p = val_p
-        except Exception:
-            pass
-
-        dict_cap_geral[f"{month}/{year}"] = l_geral * dias_mes
-        dict_cap_uti_a[f"{month}/{year}"] = l_a * dias_mes
-        dict_cap_uti_n[f"{month}/{year}"] = l_n * dias_mes
-        dict_cap_uti_p[f"{month}/{year}"] = l_p * dias_mes
-
-    # --- FASE 2: SIH (PRODUÇÃO - LÓGICA HÍBRIDA MARCA/IDADE) ---
-    for month in meses:
-        year = ano
-        # Inicializa Variáveis
-        total_saidas = 0; obitos_inst = 0
-        dias_gerais_reais = 0
-        dias_med = 0; saidas_med = 0
-        dias_cir = 0; saidas_cir = 0
-        dias_uti_a = 0; dias_uti_n = 0; dias_uti_p = 0
-
-        try:
-            files = sih_db.get_files(group="RD", uf=uf, year=year, month=month)
-            if files:
-                df = sih_db.download(files).to_dataframe()
-                df.columns = [c.upper().strip() for c in df.columns]
+    # ------------------- 1. RD (Mortalidade, Ocupação, TMP) -------------------
+    try:
+        files_rd = sih_db.get_files(group="RD", uf=uf, year=year, month=month)
+        if files_rd:
+            df_rd = sih_db.download(files_rd).to_dataframe()
+            df_rd.columns = [c.upper().strip() for c in df_rd.columns]
+            
+            cnes_c = encontrar_coluna(df_rd, ["CNES", "CNES_EXEC"])
+            if cnes_c:
+                df_rd['CNES_INT'] = pd.to_numeric(df_rd[cnes_c], errors='coerce').fillna(0).astype(int)
+                df_rd = df_rd[df_rd['CNES_INT'] == int(cnes_filter)].copy()
                 
-                cnes_c = encontrar_coluna(df, ["CNES", "CNES_EXEC", "M_CNES"])
-                if cnes_c:
-                    df[cnes_c] = df[cnes_c].astype(str).str.strip().str.zfill(7)
-                    df_hosp = df[df[cnes_c] == str(cnes_filter)].copy()
+                if not df_rd.empty:
+                    c_morte = encontrar_coluna(df_rd, ["MORTE", "OBITO"])
+                    c_dias = encontrar_coluna(df_rd, ["DIAS_PERM", "QT_DIARIAS"])
+                    c_clinica = encontrar_coluna(df_rd, ["ESPEC"])
                     
-                    if not df_hosp.empty:
-                        col_morte = encontrar_coluna(df_hosp, ["MORTE", "OBITO"])
-                        col_dias  = encontrar_coluna(df_hosp, ["DIAS_PERM", "QT_DIARIAS", "DIAS"])
-                        col_proc  = encontrar_coluna(df_hosp, ["PROC_REA", "PROC_REALIZADO"])
-                        col_uti_dias = encontrar_coluna(df_hosp, ["UTI_MES_TO", "QT_DIARIAS_UTI"])
-                        col_idade = encontrar_coluna(df_hosp, ["IDADE", "ID_PACIENTE"])
-                        col_marca = encontrar_coluna(df_hosp, ["MARCA_UTI"]) # Coluna Chave
+                    print("RD columns:", df_rd.columns.tolist())
+                    print("c_clinica (ESPEC):", c_clinica)
+                    
+                    if c_morte: df_rd[c_morte] = pd.to_numeric(df_rd[c_morte], errors='coerce').fillna(0).astype(int)
+                    if c_dias: df_rd[c_dias] = pd.to_numeric(df_rd[c_dias], errors='coerce').fillna(0).astype(int)
 
-                        if col_morte and col_dias:
-                            df_hosp["IS_OBITO"] = pd.to_numeric(df_hosp[col_morte], errors='coerce').fillna(0).astype(int)
-                            df_hosp["QTD_DIAS"] = pd.to_numeric(df_hosp[col_dias], errors='coerce').fillna(0).astype(int)
-                            
-                            if col_uti_dias: df_hosp[col_uti_dias] = pd.to_numeric(df_hosp[col_uti_dias], errors='coerce').fillna(0)
-                            else: df_hosp["UTI_TEMP"] = 0; col_uti_dias = "UTI_TEMP"
+                    if c_morte and c_dias:
+                        # Mortalidade
+                        d["saidas_tot"] = len(df_rd)
+                        d["obitos_tot"] = df_rd[df_rd[c_morte] == 1].shape[0]
+                        # Ocupação Geral (Soma Total RD)
+                        d["dias_geral"] = df_rd[c_dias].sum()
 
-                            if col_proc:
-                                df_hosp["PROC_STR"] = df_hosp[col_proc].astype(str).str.strip()
-                                df_hosp["GRUPO_PROC"] = df_hosp["PROC_STR"].str.slice(0, 2)
-                            else: df_hosp["PROC_STR"] = ""; df_hosp["GRUPO_PROC"] = "99"
-                            
-                            # Tratamento da Marca UTI (Padroniza para 2 dígitos string)
-                            if col_marca:
-                                df_hosp["MARCA_STR"] = df_hosp[col_marca].astype(str).str.strip().str.zfill(2)
-                            else:
-                                df_hosp["MARCA_STR"] = "00"
+                        # TMP from RD
+                        if c_clinica:
+                            df_rd['clinica_int'] = pd.to_numeric(df_rd[c_clinica], errors='coerce').fillna(0).astype(int)
+                            print("Unique clinica_int:", df_rd['clinica_int'].unique())
+                            df_med_rd = df_rd[df_rd['clinica_int'] == 1]  # Clinica Medica
+                            d["dias_med"] = df_med_rd[c_dias].sum()
+                            d["saidas_med"] = len(df_med_rd)
+                            df_cir_rd = df_rd[df_rd['clinica_int'] == 2]  # Cirurgia
+                            d["dias_cir"] = df_cir_rd[c_dias].sum()
+                            d["saidas_cir"] = len(df_cir_rd)
 
-                            # 1. Mortalidade
-                            total_saidas = len(df_hosp)
-                            obitos_inst = df_hosp[(df_hosp["IS_OBITO"] == 1) & (df_hosp["QTD_DIAS"] >= 1)].shape[0]
-                            
-                            # 2. Ocupação Geral
-                            dias_totais = df_hosp["QTD_DIAS"].sum()
-                            dias_uti_total = df_hosp[col_uti_dias].sum()
-                            dias_gerais_reais = max(0, dias_totais - dias_uti_total)
-                            
-                            # 3. TMP
-                            df_med = df_hosp[df_hosp["GRUPO_PROC"] == '03']
-                            dias_med = df_med["QTD_DIAS"].sum(); saidas_med = len(df_med)
-                            
-                            df_cir = df_hosp[df_hosp["GRUPO_PROC"] == '04']
-                            dias_cir = df_cir["QTD_DIAS"].sum(); saidas_cir = len(df_cir)
-                            
-                            # UTIs (LÓGICA: MARCA -> IDADE)
-                            mask_uti = df_hosp[col_uti_dias] > 0
-                            if mask_uti.any():
-                                for _, row in df_hosp[mask_uti].iterrows():
-                                    dias = row[col_uti_dias]
-                                    marca = row.get("MARCA_STR", "00")
-                                    
-                                    try: idade = int(row[col_idade]) if col_idade else 999
-                                    except: idade = 999
-                                    
-                                    # REGRA 1: MARCA EXPLÍCITA
-                                    if marca in MARCA_ADULTO:
-                                        dias_uti_a += dias
-                                    elif marca in MARCA_NEO:
-                                        dias_uti_n += dias
-                                    elif marca in MARCA_PED:
-                                        dias_uti_p += dias
-                                    else:
-                                        # REGRA 2: FALLBACK POR IDADE (Marcas 00, 01, 99, etc)
-                                        if idade < 1:
-                                            dias_uti_n += dias
-                                        elif 1 <= idade < 14:
-                                            dias_uti_p += dias
-                                        else:
-                                            dias_uti_a += dias
-        except Exception:
-            pass
+                    # TMP movido para SP
 
-        cap_g = dict_cap_geral.get(f"{month}/{year}", 1)
-        cap_a = dict_cap_uti_a.get(f"{month}/{year}", 1)
-        cap_n = dict_cap_uti_n.get(f"{month}/{year}", 1)
-        cap_p = dict_cap_uti_p.get(f"{month}/{year}", 1)
+    except Exception: pass
 
-        # Taxas Mensais
-        raw_taxa_ocup = (dias_gerais_reais / cap_g * 100)
-        taxa_ocup = min(raw_taxa_ocup, 100.00)
-        
-        raw_taxa_a = (dias_uti_a / cap_a * 100)
-        taxa_a = min(raw_taxa_a, 100.00)
+    # ------------------- 2. SP (UTIs - ATOPROF + Filtro Idade) -------------------
+    try:
+        files_sp = sih_db.get_files(group="SP", uf=uf, year=year, month=month)
+        if files_sp:
+            df_sp = sih_db.download(files_sp).to_dataframe()
+            df_sp.columns = [c.upper().strip() for c in df_sp.columns]
+            
+            cnes_s = encontrar_coluna(df_sp, ["CNES", "SP_CNES"])
+            if cnes_s:
+                df_sp['CNES_INT'] = pd.to_numeric(df_sp[cnes_s], errors='coerce').fillna(0).astype(int)
+                df_sp = df_sp[df_sp['CNES_INT'] == int(cnes_filter)].copy()
+                
+                if not df_sp.empty:
+                    c_ato_uti = next((c for c in df_sp.columns if "ATOPROF" in c), "SP_ATOPROF")
+                    c_ato_tmp = next((c for c in df_sp.columns if "PROCREA" in c), "SP_PROCREA")
+                    c_qtd = next((c for c in df_sp.columns if "QT_" in c), "SP_QTD_ATO")
+                    c_val = next((c for c in df_sp.columns if "VAL" in c), "SP_VALATO")
+                    c_aih = next((c for c in df_sp.columns if "NAIH" in c), "SP_NAIH")
+                    
+                    # DEBUG raw
+                    d['raw_unique_atoprof'] = sorted(df_sp[c_ato_uti].unique()) if c_ato_uti in df_sp.columns else []
+                    d['raw_unique_procrea'] = sorted(df_sp[c_ato_tmp].unique()) if c_ato_tmp in df_sp.columns else []
+                    
+                    # Limpeza
+                    df_sp[c_ato_uti] = df_sp[c_ato_uti].astype(str).str.strip().str.replace(r"[^0-9]", "", regex=True)
+                    df_sp[c_ato_tmp] = df_sp[c_ato_tmp].astype(str).str.strip().str.replace(r"[^0-9]", "", regex=True)
+                    df_sp[c_qtd] = pd.to_numeric(df_sp[c_qtd], errors='coerce').fillna(0).astype(int)
+                    df_sp[c_val] = pd.to_numeric(df_sp[c_val], errors='coerce').fillna(0.0)
+                    
+                    # Filtro 1: Apenas Linhas Pagas e com QT_ > 0
+                    df_ok = df_sp[(df_sp[c_val] > 0) & (df_sp[c_qtd] > 0)].copy()
+                    
+                    if not df_ok.empty:
+                        print("Colunas SP:", df_sp.columns.tolist())
+                        print("Valores únicos ATOPROF (UTI):", df_sp[c_ato_uti].unique()[:20])
+                        print("Valores únicos PROCREA (TMP):", df_sp[c_ato_tmp].unique()[:20])
+                        
+                        # Filtros por código ATOPROF específico da UTI
+                        mask_a = (df_ok[c_ato_uti] == '0802010083')
+                        mask_n = (df_ok[c_ato_uti] == '0802010121')
+                        mask_p = (df_ok[c_ato_uti] == '0802010156')
 
-        raw_taxa_n = (dias_uti_n / cap_n * 100)
-        taxa_n = min(raw_taxa_n, 100.00)
+                        # DEBUG SP
+                        d['sp_columns'] = list(df_sp.columns)
+                        d['unique_atoprof'] = sorted(df_sp[c_ato_uti].unique()) if c_ato_uti in df_sp.columns else []
+                        d['unique_procrea'] = sorted(df_sp[c_ato_tmp].unique()) if c_ato_tmp in df_sp.columns else []
 
-        raw_taxa_p = (dias_uti_p / cap_p * 100)
-        taxa_p = min(raw_taxa_p, 100.00)
+                        # Agrupa por AIH e ato, soma QT_ (dias de UTI)
+                        df_a = df_ok[mask_a].groupby([c_aih, c_ato_uti])[c_qtd].sum().reset_index()
+                        d["dias_a"] = df_a[c_qtd].sum()
+                        
+                        df_n = df_ok[mask_n].groupby([c_aih, c_ato_uti])[c_qtd].sum().reset_index()
+                        d["dias_n"] = df_n[c_qtd].sum()
+                        
+                        df_p = df_ok[mask_p].groupby([c_aih, c_ato_uti])[c_qtd].sum().reset_index()
+                        d["dias_p"] = df_p[c_qtd].sum()
 
-        stats_list.append({
-            "periodo": f"{str(month).zfill(2)}/{str(year)[-2:]}",
-            "mes_int": month,
-            "saidas_tot": total_saidas, "obitos_tot": obitos_inst,
-            "dias_geral": dias_gerais_reais, "cap_geral": cap_g,
-            "dias_med": dias_med, "saidas_med": saidas_med,
-            "dias_cir": dias_cir, "saidas_cir": saidas_cir,
-            "dias_a": dias_uti_a, "cap_a": cap_a,
-            "dias_n": dias_uti_n, "cap_n": cap_n,
-            "dias_p": dias_uti_p, "cap_p": cap_p,
-            # Para Gráficos Mensais
-            "tx_mort_m": (obitos_inst / total_saidas * 100) if total_saidas > 0 else 0,
-            "tx_ocup_m": taxa_ocup, "raw_taxa_ocup": raw_taxa_ocup,
-            "tmp_med_m": (dias_med / saidas_med) if saidas_med > 0 else 0,
-            "tmp_cir_m": (dias_cir / saidas_cir) if saidas_cir > 0 else 0,
-            "tx_a_m": taxa_a, "raw_taxa_uti_a": raw_taxa_a,
-            "tx_n_m": taxa_n, "raw_taxa_uti_n": raw_taxa_n,
-            "tx_p_m": taxa_p, "raw_taxa_uti_p": raw_taxa_p
-        })
+    except Exception: pass
 
-    return pd.DataFrame(stats_list)
+    d.update({"cap_geral": caps['geral'], "cap_a": caps['uti_a'], "cap_n": caps['uti_n'], "cap_p": caps['uti_p']})
+    return d
 
 # ===================== PLOTAGEM =====================
-def plot_indicador(ax, df, col_y, media, nota, meta, color_ok, title, ylabel="Taxa (%)", is_tmp=False, fixed_ylim=None, is_inf=False):
+def plot_indicador(ax, df, col_y, media, nota, meta, color_ok, title, is_tmp=False, fixed_ylim=None, is_inf=False):
     x = df["periodo"]
     y = df[col_y].fillna(0)
-    
-    colors = []
-    for val in y:
-        if val > 100 and not is_tmp and not is_inf: colors.append('#7209b7')
-        else: colors.append(color_ok)
-    
+    colors = ['#7209b7' if (val > 100 and not is_tmp and not is_inf) else color_ok for val in y]
     ax.bar(x, y, color=colors, alpha=0.8, width=0.5)
-    
     unit = "‰" if is_inf else ("d" if is_tmp else "%")
-    title_fmt = f"{title}\nMedia: {media:.2f}{unit} | Nota: {nota:.2f}"
-    ax.set_title(title_fmt, fontweight='bold', fontsize=10)
-    
-    max_val = max(y.max() if not y.empty else 0, media)
-    if not np.isfinite(max_val): max_val = 0
-    
-    if fixed_ylim:
-        ax.set_ylim(fixed_ylim)
-        limit = fixed_ylim[1]
-    else:
-        limit = 10 if max_val <= 0 else (105 if (not is_tmp and not is_inf and max_val <= 100) else max_val * 1.35)
-        ax.set_ylim(0, limit)
-        
+    ax.set_title(f"{title}\nMedia: {media:.2f}{unit} | Nota: {nota}", fontweight='bold', fontsize=10)
+    if fixed_ylim: ax.set_ylim(fixed_ylim)
+    else: ax.set_ylim(0, 10 if y.max() <= 0 else (105 if (not is_tmp and not is_inf and y.max() <= 100) else y.max() * 1.3))
     ax.grid(axis='y', linestyle='--', alpha=0.3)
     ax.axhline(media, color='blue', linestyle='--', label=f'Media ({media:.2f})')
-    
-    label_meta = f"Meta (<={meta}‰)" if is_inf else (f"Meta (<{meta})" if is_tmp else f"Meta (>={meta}%)" if meta > 10 else f"Meta (<={meta:.2f}%)")
-    ax.axhline(meta, color='green', linestyle=':', label=label_meta)
-    
-    if not is_tmp and not is_inf and max_val > 100:
-        ax.axhline(100, color='#7209b7', linestyle='--', label='Capac. (100%)')
-
+    ax.axhline(meta, color='green', linestyle=':', label='Meta')
     ax.legend(loc='lower right', fontsize='x-small')
-    
     for i, val in enumerate(y):
-        txt = f"{val:.2f}"
-        if not is_tmp: txt += "%" if not is_inf else "‰"
-        y_pos = val + (limit * 0.02)
-        ax.text(i, y_pos, txt, ha='center', fontweight='bold', fontsize=9)
-        if not is_tmp and not is_inf and val > 100:
-            y_pos_risk = val + (limit * 0.12)
-            ax.text(i, y_pos_risk, "LEITOS EXTRAS", ha='center', color='#7209b7', fontweight='bold', fontsize=8)
+        txt = f"{val:.2f}" + ("" if is_tmp else ("‰" if is_inf else "%"))
+        ax.text(i, val + (ax.get_ylim()[1] * 0.02), txt, ha='center', fontweight='bold', fontsize=8)
 
-# ===================== GERAR PDF =====================
-def gerar_pdf_buffer(df_stats, cnes_filter, totais):
+def gerar_pdf_buffer(df, cnes, t):
     buffer = io.BytesIO()
     with PdfPages(buffer) as pdf:
         FIG_SIZE = (18, 12)
-        
-        # PAG 1
+        # P1
         fig1, axs1 = plt.subplots(2, 2, figsize=FIG_SIZE)
-        plt.suptitle(f"Painel de Indicadores (Geral) - CNES {cnes_filter}", fontsize=16, fontweight='bold')
-        plt.subplots_adjust(hspace=0.4, wspace=0.3, top=0.9)
-        plot_indicador(axs1[0,0], df_stats, "tx_mort_m", totais['tx_mort'], totais['p_mort'], 3, '#2a9d8f', "1. Mortalidade Inst.", fixed_ylim=(0,10))
-        plot_indicador(axs1[0,1], df_stats, "tx_ocup_m", totais['tx_ocup'], totais['p_ocup'], 80, '#2a9d8f', "2. Ocupacao Geral (Sem UTI)")
-        plot_indicador(axs1[1,0], df_stats, "tmp_med_m", totais['tx_med'], totais['p_med'], 8, '#2a9d8f', "3. TMP Clinica Medica", ylabel="Dias", is_tmp=True)
-        plot_indicador(axs1[1,1], df_stats, "tmp_cir_m", totais['tx_cir'], totais['p_cir'], 5, '#2a9d8f', "4. TMP Clinica Cirurgica", ylabel="Dias", is_tmp=True)
+        plt.suptitle(f"Indicadores Gerais - CNES {cnes}", fontsize=16, fontweight='bold')
+        plot_indicador(axs1[0,0], df, "tx_mort_m", t['tx_mort'], t['p_mort'], 3, '#2a9d8f', "Mortalidade", fixed_ylim=(0,10))
+        plot_indicador(axs1[0,1], df, "tx_ocup_m", t['tx_ocup'], t['p_ocup'], 80, '#2a9d8f', "Ocupacao Geral")
+        plot_indicador(axs1[1,0], df, "tmp_med_m", t['tx_med'], t['p_med'], 8, '#2a9d8f', "TMP Clinica Medica", is_tmp=True)
+        plot_indicador(axs1[1,1], df, "tmp_cir_m", t['tx_cir'], t['p_cir'], 5, '#2a9d8f', "TMP Clinica Cirurgica", is_tmp=True)
         pdf.savefig(fig1); plt.close()
-
-        # PAG 2
+        # P2
         fig2, axs2 = plt.subplots(2, 2, figsize=FIG_SIZE)
-        plt.suptitle(f"Painel de Indicadores (UTI) - CNES {cnes_filter}", fontsize=16, fontweight='bold')
-        plt.subplots_adjust(hspace=0.4, wspace=0.3, top=0.9)
-        plot_indicador(axs2[0,0], df_stats, "tx_a_m", totais['tx_a'], totais['p_a'], 85, '#2a9d8f', "5. UTI Adulto")
-        plot_indicador(axs2[0,1], df_stats, "tx_n_m", totais['tx_n'], totais['p_n'], 85, '#2a9d8f', "6. UTI Neonatal")
-        plot_indicador(axs2[1,0], df_stats, "tx_p_m", totais['tx_p'], totais['p_p'], 85, '#2a9d8f', "7. UTI Pediatrica")
-        plot_indicador(axs2[1,1], df_stats, "dens_inf_m", totais['tx_inf'], totais['p_inf'], 2.0, '#2a9d8f', "8. Infeccao CVC Adulto", is_inf=True)
+        plt.suptitle(f"Indicadores UTI - CNES {cnes}", fontsize=16, fontweight='bold')
+        plot_indicador(axs2[0,0], df, "tx_a_m", t['tx_a'], t['p_a'], 85, '#2a9d8f', "UTI Adulto")
+        plot_indicador(axs2[0,1], df, "tx_n_m", t['tx_n'], t['p_n'], 85, '#2a9d8f', "UTI Neo")
+        plot_indicador(axs2[1,0], df, "tx_p_m", t['tx_p'], t['p_p'], 85, '#2a9d8f', "UTI Ped")
+        plot_indicador(axs2[1,1], df, "dens_inf_m", t['tx_inf'], t['p_inf'], 2.0, '#2a9d8f', "Infeccao CVC", is_inf=True)
         pdf.savefig(fig2); plt.close()
-
-        # PAG 3
+        # P3
         fig3 = plt.figure(figsize=FIG_SIZE)
         plt.axis('off')
-        plt.title("RESUMO EXECUTIVO - DADOS E PONTUACAO", fontsize=20, fontweight='bold')
-        t = totais
-        data_table = [
-            ["INDICADOR", "FORMULA (Agregada)", "DADOS BRUTOS (Soma)", "RESULTADO", "NOTA (Max)"],
-            ["1. Mort. Inst.", "Obitos / Saidas", f"{t['s_obitos']} / {t['s_saidas']}", f"{t['tx_mort']:.2f}%", f"{t['p_mort']:.2f} / 7"],
-            ["2. Ocup. Geral", "Dias / Leitos-Dia", f"{t['s_dias_g']} / {t['s_cap_g']}", f"{t['tx_ocup']:.2f}%", f"{t['p_ocup']:.2f} / 7"],
-            ["3. TMP Medica", "Dias / Saidas", f"{t['s_dias_m']} / {t['s_sai_m']}", f"{t['tx_med']:.2f} d", f"{t['p_med']:.2f} / 6"],
-            ["4. TMP Cirurgica", "Dias / Saidas", f"{t['s_dias_c']} / {t['s_sai_c']}", f"{t['tx_cir']:.2f} d", f"{t['p_cir']:.2f} / 6"],
-            ["5. UTI Adulto", "Dias / Leitos-Dia", f"{t['s_dias_a']} / {t['s_cap_a']}", f"{t['tx_a']:.2f}%", f"{t['p_a']:.2f} / 6"],
-            ["6. UTI Neo", "Dias / Leitos-Dia", f"{t['s_dias_n']} / {t['s_cap_n']}", f"{t['tx_n']:.2f}%", f"{t['p_n']:.2f} / 6"],
-            ["7. UTI Ped", "Dias / Leitos-Dia", f"{t['s_dias_p']} / {t['s_cap_p']}", f"{t['tx_p']:.2f}%", f"{t['p_p']:.2f} / 6"],
-            ["8. Infeccao", "Casos / Dias-CVC * 1000", f"{t['s_casos']} / {t['s_cvc']}", f"{t['tx_inf']:.2f}‰", f"{t['p_inf']:.2f} / 6"]
+        plt.title("RESUMO EXECUTIVO", fontsize=20, fontweight='bold')
+        dt = [
+            ["INDICADOR", "DADOS (Soma)", "RESULTADO", "NOTA"],
+            ["Mortalidade", f"{t['s_obitos']}/{t['s_saidas']}", f"{t['tx_mort']:.2f}%", f"{t['p_mort']}/7"],
+            ["Ocup. Geral", f"{t['s_dias_g']}/{t['s_cap_g']}", f"{t['tx_ocup']:.2f}%", f"{t['p_ocup']}/7"],
+            ["TMP Medica", f"{t['s_dias_m']}/{t['s_sai_m']}", f"{t['tx_med']:.2f} d", f"{t['p_med']}/6"],
+            ["TMP Cirurgica", f"{t['s_dias_c']}/{t['s_sai_c']}", f"{t['tx_cir']:.2f} d", f"{t['p_cir']}/6"],
+            ["UTI Adulto", f"{t['s_dias_a']}/{t['s_cap_a']}", f"{t['tx_a']:.2f}%", f"{t['p_a']}/6"],
+            ["UTI Neo", f"{t['s_dias_n']}/{t['s_cap_n']}", f"{t['tx_n']:.2f}%", f"{t['p_n']}/6"],
+            ["UTI Ped", f"{t['s_dias_p']}/{t['s_cap_p']}", f"{t['tx_p']:.2f}%", f"{t['p_p']}/6"],
+            ["Infeccao", f"{t['s_casos']}/{t['s_cvc']}", f"{t['tx_inf']:.2f}‰", f"{t['p_inf']}/6"],
+            ["TOTAL", "", "", f"{t['total_pts']:.2f}/50"]
         ]
-        data_table.append(["TOTAL GERAL", "", "", "", f"{t['total_pts']:.2f} / 50"])
-        table = plt.table(cellText=data_table, colLabels=None, cellLoc='center', loc='center', bbox=[0.05, 0.2, 0.9, 0.6])
-        table.auto_set_font_size(False); table.set_fontsize(11); table.scale(1, 2)
-        for (row, col), cell in table.get_celld().items():
-            if row == 0: cell.set_facecolor('#4a4e69'); cell.set_text_props(weight='bold', color='white')
-            elif row == len(data_table)-1: cell.set_facecolor('#e9c46a'); cell.set_text_props(weight='bold')
-            elif row % 2 == 0: cell.set_facecolor('#f2f2f2')
+        tab = plt.table(cellText=dt, colLabels=None, loc='center', bbox=[0.05, 0.2, 0.9, 0.6])
+        tab.auto_set_font_size(False); tab.set_fontsize(12); tab.scale(1, 2)
         pdf.savefig(fig3); plt.close()
-    buffer.seek(0)
-    return buffer
+    buffer.seek(0); return buffer
 
 # ===================== UI =====================
 with st.sidebar:
-    st.header("Configuracoes")
-    cnes_input = st.text_input("Codigo CNES", "2142376")
+    st.header("Configurações")
+    cnes_input = st.text_input("CNES", "2142376")
     uf_input = st.selectbox("Estado", ["MG"], index=0)
     ano_sel = st.selectbox("Ano", [2023, 2024, 2025], index=2)
     quad_sel = st.selectbox("Quadrimestre", ["Q1 (Jan-Abr)", "Q2 (Mai-Ago)", "Q3 (Set-Dez)"], index=1)
     meses_sel = get_meses_quadrimestre(quad_sel)
+    
     st.markdown("### Indicador 8 (Manual)")
-    manual_input = []
-    with st.expander("Dados CCIH (IPCSL/CVC)", expanded=False):
+    manual = []
+    with st.expander("Dados CCIH", expanded=False):
         for m in meses_sel:
-            st.markdown(f"**{m:02d}/{ano_sel}**")
-            c1, c2 = st.columns(2)
-            c = c1.number_input(f"Casos ({m})", 0, 100, 0, key=f"c_{m}")
-            d = c2.number_input(f"Dias CVC ({m})", 0, 5000, 0, key=f"d_{m}")
-            manual_input.append((ano_sel, m, c, d))
+            c = st.number_input(f"Casos {m:02d}", 0, 100, 0, key=f"c_{m}")
+            d = st.number_input(f"Dias CVC {m:02d}", 0, 5000, 0, key=f"d_{m}")
+            manual.append((ano_sel, m, c, d))
     if st.button("Limpar Cache"): st.cache_data.clear()
 
 if st.button("Processar Dados", type="primary"):
-    with st.spinner("Baixando dados do DATASUS e calculando..."):
-        df_final = processar_dados(ano_sel, meses_sel, uf_input, cnes_input)
-        
-        df_manual = pd.DataFrame(manual_input, columns=["ano", "mes", "casos_ipcs", "dias_cvc"])
-        df_final["mes_int"] = df_final["mes_int"].astype(int)
-        df_manual["mes"] = df_manual["mes"].astype(int)
-        df_manual["mes_int"] = df_manual["mes"]
-        df_final = pd.merge(df_final, df_manual, on="mes_int", how="left")
-        
-        df_final["tx_mort_m"] = df_final["obitos_tot"] / df_final["saidas_tot"] * 100
-        df_final["tx_ocup_m"] = (df_final["dias_geral"] / df_final["cap_geral"] * 100).clip(upper=100)
-        df_final["tmp_med_m"] = df_final["dias_med"] / df_final["saidas_med"]
-        df_final["tmp_cir_m"] = df_final["dias_cir"] / df_final["saidas_cir"]
-        df_final["tx_a_m"] = (df_final["dias_a"] / df_final["cap_a"] * 100).fillna(0)
-        df_final["tx_n_m"] = (df_final["dias_n"] / df_final["cap_n"] * 100).fillna(0)
-        df_final["tx_p_m"] = (df_final["dias_p"] / df_final["cap_p"] * 100).fillna(0)
-        df_final["dens_inf_m"] = (df_final["casos_ipcs"] / df_final["dias_cvc"] * 1000).fillna(0)
+    bar = st.progress(0); status = st.empty()
+    res = []
+    for i, m in enumerate(meses_sel):
+        status.text(f"Processando {m:02d}/{ano_sel}...")
+        res.append(processar_mes_unico(ano_sel, m, uf_input, cnes_input))
+        bar.progress((i+1)/len(meses_sel))
+    
+    status.text("Calculando indicadores..."); bar.progress(100)
+    
+    df = pd.DataFrame(res)
+    df["periodo"] = df["mes"].apply(lambda x: f"{x:02d}")
+    
+    man = pd.DataFrame(manual, columns=["ano", "mes", "casos", "cvc"])
+    df = pd.merge(df, man, on="mes", how="left")
+    
+    # Indicadores Mensais
+    df["tx_mort_m"] = (df["obitos_tot"]/df["saidas_tot"]*100).fillna(0)
+    df["tx_ocup_m"] = (df["dias_geral"]/df["cap_geral"]*100).clip(upper=100).fillna(0)
+    df["tmp_med_m"] = (df["dias_med"]/df["saidas_med"]).fillna(0)
+    df["tmp_cir_m"] = (df["dias_cir"]/df["saidas_cir"]).fillna(0)
+    df["tx_a_m"] = (df["dias_a"]/df["cap_a"]*100).fillna(0)
+    df["tx_n_m"] = (df["dias_n"]/df["cap_n"]*100).fillna(0)
+    df["tx_p_m"] = (df["dias_p"]/df["cap_p"]*100).fillna(0)
+    df["dens_inf_m"] = (df["casos"]/df["cvc"]*1000).fillna(0)
 
-        # Totais
-        t = {}
-        t['s_obitos'] = df_final["obitos_tot"].sum(); t['s_saidas'] = df_final["saidas_tot"].sum()
-        t['tx_mort'] = (t['s_obitos'] / t['s_saidas'] * 100) if t['s_saidas'] > 0 else 0
-        t['p_mort'] = pontuacao_mortalidade(t['tx_mort'])
-        
-        t['s_dias_g'] = df_final["dias_geral"].sum(); t['s_cap_g'] = df_final["cap_geral"].sum()
-        t['tx_ocup'] = (t['s_dias_g'] / t['s_cap_g'] * 100) if t['s_cap_g'] > 0 else 0
-        t['p_ocup'] = pontuacao_ocupacao(t['tx_ocup'])
-        
-        t['s_dias_m'] = df_final["dias_med"].sum(); t['s_sai_m'] = df_final["saidas_med"].sum()
-        t['tx_med'] = (t['s_dias_m'] / t['s_sai_m']) if t['s_sai_m'] > 0 else 0
-        t['p_med'] = pontuacao_tmp_medica(t['tx_med'])
-        
-        t['s_dias_c'] = df_final["dias_cir"].sum(); t['s_sai_c'] = df_final["saidas_cir"].sum()
-        t['tx_cir'] = (t['s_dias_c'] / t['s_sai_c']) if t['s_sai_c'] > 0 else 0
-        t['p_cir'] = pontuacao_tmp_cirurgica(t['tx_cir'])
-        
-        t['s_dias_a'] = df_final["dias_a"].sum(); t['s_cap_a'] = df_final["cap_a"].sum()
-        t['tx_a'] = (t['s_dias_a'] / t['s_cap_a'] * 100) if t['s_cap_a'] > 0 else 0
-        t['p_a'] = pontuacao_uti(t['tx_a'])
-        
-        t['s_dias_n'] = df_final["dias_n"].sum(); t['s_cap_n'] = df_final["cap_n"].sum()
-        t['tx_n'] = (t['s_dias_n'] / t['s_cap_n'] * 100) if t['s_cap_n'] > 0 else 0
-        t['p_n'] = pontuacao_uti(t['tx_n'])
-        
-        t['s_dias_p'] = df_final["dias_p"].sum(); t['s_cap_p'] = df_final["cap_p"].sum()
-        t['tx_p'] = (t['s_dias_p'] / t['s_cap_p'] * 100) if t['s_cap_p'] > 0 else 0
-        t['p_p'] = pontuacao_uti(t['tx_p'])
-        
-        t['s_casos'] = df_final["casos_ipcs"].sum(); t['s_cvc'] = df_final["dias_cvc"].sum()
-        t['tx_inf'] = (t['s_casos'] / t['s_cvc'] * 1000) if t['s_cvc'] > 0 else 0
-        t['p_inf'] = pontuacao_infeccao(t['tx_inf'])
-        
-        t['total_pts'] = t['p_mort'] + t['p_ocup'] + t['p_med'] + t['p_cir'] + t['p_a'] + t['p_n'] + t['p_p'] + t['p_inf']
+    # Totais
+    t = {}
+    t['s_obitos'] = df['obitos_tot'].sum(); t['s_saidas'] = df['saidas_tot'].sum()
+    t['s_dias_g'] = df['dias_geral'].sum(); t['s_cap_g'] = df['cap_geral'].sum()
+    t['s_dias_m'] = df['dias_med'].sum(); t['s_sai_m'] = df['saidas_med'].sum()
+    t['s_dias_c'] = df['dias_cir'].sum(); t['s_sai_c'] = df['saidas_cir'].sum()
+    t['s_dias_a'] = df['dias_a'].sum(); t['s_cap_a'] = df['cap_a'].sum()
+    t['s_dias_n'] = df['dias_n'].sum(); t['s_cap_n'] = df['cap_n'].sum()
+    t['s_dias_p'] = df['dias_p'].sum(); t['s_cap_p'] = df['cap_p'].sum()
+    t['s_casos'] = df['casos'].sum(); t['s_cvc'] = df['cvc'].sum()
 
-        st.success("Calculo concluido!")
+    # Taxas Finais
+    t['tx_mort'] = (t['s_obitos']/t['s_saidas']*100) if t['s_saidas'] else 0
+    t['tx_ocup'] = (t['s_dias_g']/t['s_cap_g']*100) if t['s_cap_g'] else 0
+    t['tx_med'] = (t['s_dias_m']/t['s_sai_m']) if t['s_sai_m'] else 0
+    t['tx_cir'] = (t['s_dias_c']/t['s_sai_c']) if t['s_sai_c'] else 0
+    t['tx_a'] = (t['s_dias_a']/t['s_cap_a']*100) if t['s_cap_a'] else 0
+    t['tx_n'] = (t['s_dias_n']/t['s_cap_n']*100) if t['s_cap_n'] else 0
+    t['tx_p'] = (t['s_dias_p']/t['s_cap_p']*100) if t['s_cap_p'] else 0
+    t['tx_inf'] = (t['s_casos']/t['s_cvc']*1000) if t['s_cvc'] else 0
+
+    # Pontos
+    t['p_mort'] = pontuacao_mortalidade(t['tx_mort'])
+    t['p_ocup'] = pontuacao_ocupacao(t['tx_ocup'])
+    t['p_med'] = pontuacao_tmp_medica(t['tx_med'])
+    t['p_cir'] = pontuacao_tmp_cirurgica(t['tx_cir'])
+    t['p_a'] = pontuacao_uti(t['tx_a'])
+    t['p_n'] = pontuacao_uti(t['tx_n'])
+    t['p_p'] = pontuacao_uti(t['tx_p'])
+    t['p_inf'] = pontuacao_infeccao(t['tx_inf'])
+    t['total_pts'] = t['p_mort'] + t['p_ocup'] + t['p_med'] + t['p_cir'] + t['p_a'] + t['p_n'] + t['p_p'] + t['p_inf']
+
+    status.success("Concluído!")
+    
+    # LOG VISUAL
+    with st.expander("🕵️ LOG DE AUDITORIA", expanded=True):
+        st.markdown(f"""
+        **1. OCUPAÇÃO GERAL (GLOBAL)**
+        - Dias Totais: `{t['s_dias_g']}` (Meta: 9424) | Capacidade: `{t['s_cap_g']}`
+        - Resultado: `{t['tx_ocup']:.2f}%` (Meta: 86.08%)
         
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Pontuacao Total", f"{t['total_pts']:.2f} / 50")
-        col2.metric("Mortalidade", f"{t['tx_mort']:.2f}%", f"Nota {t['p_mort']}")
-        col3.metric("Ocup. Geral", f"{t['tx_ocup']:.2f}%", f"Nota {t['p_ocup']}")
-        col4.metric("Infeccao CVC", f"{t['tx_inf']:.2f}‰", f"Nota {t['p_inf']}")
+        **2. UTIs (SP - ATOPROF Códigos SIGTAP)**
+        - Adulto: `{t['s_dias_a']}` dias (Meta: 2013) -> `{t['tx_a']:.2f}%`
+        - Neo: `{t['s_dias_n']}` dias (Meta: 943) -> `{t['tx_n']:.2f}%`
+        - Ped: `{t['s_dias_p']}` dias (Meta: 114) -> `{t['tx_p']:.2f}%`
         
-        col5, col6, col7, col8 = st.columns(4)
-        col5.metric("UTI Adulto", f"{t['tx_a']:.2f}%", f"Nota {t['p_a']}")
-        col6.metric("UTI Neo", f"{t['tx_n']:.2f}%", f"Nota {t['p_n']}")
-        col7.metric("UTI Ped", f"{t['tx_p']:.2f}%", f"Nota {t['p_p']}")
-        col8.metric("TMP Medica", f"{t['tx_med']:.2f}d", f"Nota {t['p_med']}")
+        **3. TMP CLÍNICAS**
+        - Médica: `{t['s_dias_m']}` / `{t['s_sai_m']}` = `{t['tx_med']:.2f}` (Meta: 8.44)
+        - Cirúrgica: `{t['s_dias_c']}` / `{t['s_sai_c']}` = `{t['tx_cir']:.2f}` (Meta: 4.20)
+        """)
+        st.dataframe(df[["periodo", "dias_geral", "dias_a", "dias_n", "dias_p"]])
 
-        tab1, tab2, tab3 = st.tabs([":bar_chart: Graficos", ":clipboard: Tabela", ":page_facing_up: PDF"])
+        st.markdown("**DEBUG SP INSPECTION:**")
+        if not df.empty:
+            st.write("Colunas SP:", df['sp_columns'].iloc[0])
+            all_raw_atoprof = set()
+            for u in df['raw_unique_atoprof']:
+                all_raw_atoprof.update(u)
+            st.write("Raw Unique ATOPROF (UTI, first 50):", sorted(list(all_raw_atoprof))[:50])
+            all_raw_procrea = set()
+            for u in df['raw_unique_procrea']:
+                all_raw_procrea.update(u)
+            st.write("Raw Unique PROCREA (TMP, first 50):", sorted(list(all_raw_procrea))[:50])
+            all_unique_atoprof = set()
+            for u in df['unique_atoprof']:
+                all_unique_atoprof.update(u)
+            st.write("Unique ATOPROF (UTI, all months):", sorted(all_unique_atoprof))
+            all_unique_procrea = set()
+            for u in df['unique_procrea']:
+                all_unique_procrea.update(u)
+            st.write("Unique PROCREA (TMP, all months):", sorted(all_unique_procrea))
 
-        with tab1:
-            c1, c2 = st.columns(2)
-            fig, ax = plt.subplots(figsize=(6, 4))
-            plot_indicador(ax, df_final, "tx_mort_m", t['tx_mort'], t['p_mort'], 3, '#2a9d8f', "Mortalidade", fixed_ylim=(0,10))
-            c1.pyplot(fig)
-            fig, ax = plt.subplots(figsize=(6, 4))
-            plot_indicador(ax, df_final, "tx_ocup_m", t['tx_ocup'], t['p_ocup'], 80, '#2a9d8f', "Ocupacao Geral")
-            c2.pyplot(fig)
-            c3, c4 = st.columns(2)
-            fig, ax = plt.subplots(figsize=(6, 4))
-            plot_indicador(ax, df_final, "tmp_med_m", t['tx_med'], t['p_med'], 8, '#2a9d8f', "TMP Medica", is_tmp=True)
-            c3.pyplot(fig)
-            fig, ax = plt.subplots(figsize=(6, 4))
-            plot_indicador(ax, df_final, "tmp_cir_m", t['tx_cir'], t['p_cir'], 5, '#2a9d8f', "TMP Cirurgica", is_tmp=True)
-            c4.pyplot(fig)
-            st.markdown("### Terapia Intensiva")
-            c5, c6 = st.columns(2)
-            fig, ax = plt.subplots(figsize=(6, 4))
-            plot_indicador(ax, df_final, "tx_a_m", t['tx_a'], t['p_a'], 85, '#2a9d8f', "UTI Adulto")
-            c5.pyplot(fig)
-            fig, ax = plt.subplots(figsize=(6, 4))
-            plot_indicador(ax, df_final, "tx_n_m", t['tx_n'], t['p_n'], 85, '#2a9d8f', "UTI Neonatal")
-            c6.pyplot(fig)
-            c7, c8 = st.columns(2)
-            fig, ax = plt.subplots(figsize=(6, 4))
-            plot_indicador(ax, df_final, "tx_p_m", t['tx_p'], t['p_p'], 85, '#2a9d8f', "UTI Pediatrica")
-            c7.pyplot(fig)
-            fig, ax = plt.subplots(figsize=(6, 4))
-            plot_indicador(ax, df_final, "dens_inf_m", t['tx_inf'], t['p_inf'], 2.0, '#2a9d8f', "Infeccao CVC", is_inf=True)
-            c8.pyplot(fig)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Pontuação", f"{t['total_pts']} / 50")
+    c2.metric("Mortalidade", f"{t['tx_mort']:.2f}%", f"Nota {t['p_mort']}")
+    c3.metric("Ocup. Geral", f"{t['tx_ocup']:.2f}%", f"Nota {t['p_ocup']}")
+    c4.metric("Infecção", f"{t['tx_inf']:.2f}‰", f"Nota {t['p_inf']}")
+    
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("UTI Adu", f"{t['tx_a']:.2f}%", f"Nota {t['p_a']}")
+    c6.metric("UTI Neo", f"{t['tx_n']:.2f}%", f"Nota {t['p_n']}")
+    c7.metric("UTI Ped", f"{t['tx_p']:.2f}%", f"Nota {t['p_p']}")
+    c8.metric("TMP Med", f"{t['tx_med']:.2f}d", f"Nota {t['p_med']}")
 
-        with tab2:
-            st.dataframe(df_final)
-
-        with tab3:
-            st.write("Clique abaixo para baixar o relatorio.")
-            pdf_bytes = gerar_pdf_buffer(df_final, cnes_input, t)
-            st.download_button(label="Baixar PDF", data=pdf_bytes, file_name=f"relatorio_{quad_sel}_{ano_sel}.pdf", mime="application/pdf")
+    tab1, tab2, tab3 = st.tabs(["Graficos", "Tabela", "PDF"])
+    with tab1:
+        c1, c2 = st.columns(2)
+        fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tx_mort_m", t['tx_mort'], t['p_mort'], 3, '#2a9d8f', "Mortalidade"); c1.pyplot(fig)
+        fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tx_ocup_m", t['tx_ocup'], t['p_ocup'], 80, '#2a9d8f', "Ocupacao Geral"); c2.pyplot(fig)
+        c3, c4 = st.columns(2)
+        fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tmp_med_m", t['tx_med'], t['p_med'], 8, '#2a9d8f', "TMP Med", True); c3.pyplot(fig)
+        fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tmp_cir_m", t['tx_cir'], t['p_cir'], 5, '#2a9d8f', "TMP Cir", True); c4.pyplot(fig)
+        st.markdown("### UTIs")
+        c5, c6 = st.columns(2)
+        fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tx_a_m", t['tx_a'], t['p_a'], 85, '#2a9d8f', "UTI Adulto"); c5.pyplot(fig)
+        fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tx_n_m", t['tx_n'], t['p_n'], 85, '#2a9d8f', "UTI Neo"); c6.pyplot(fig)
+        c7, c8 = st.columns(2)
+        fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tx_p_m", t['tx_p'], t['p_p'], 85, '#2a9d8f', "UTI Ped"); c7.pyplot(fig)
+        fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "dens_inf_m", t['tx_inf'], t['p_inf'], 2.0, '#2a9d8f', "Infeccao", False, None, True); c8.pyplot(fig)
+    
+    with tab2: st.dataframe(df)
+    with tab3:
+        st.download_button("Download PDF", gerar_pdf_buffer(df, cnes_input, t), "relatorio.pdf", "application/pdf")
