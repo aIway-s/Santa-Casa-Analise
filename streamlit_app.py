@@ -5,6 +5,8 @@ from matplotlib.backends.backend_pdf import PdfPages
 import calendar
 import io
 import os
+import ftplib
+import tempfile
 import traceback
 
 # Importações do PySUS com tratamento de avisos do Pylance / VS Code
@@ -23,6 +25,7 @@ except Exception as e1:
 sih_download = None
 sih_class = None
 parquets_to_dataframe = None
+read_dbc = None
 
 try:
     from pysus.online_data.SIH import download as sih_download  # type: ignore
@@ -34,6 +37,14 @@ try:
     from pysus.online_data.SIH import SIH as sih_class  # type: ignore
 except Exception:
     pass
+
+try:
+    from pysus.utilities.readdbc import read_dbc  # type: ignore
+except Exception:
+    try:
+        from pysus.utilities.dbc import read_dbc  # type: ignore
+    except Exception:
+        pass
 
 # ===================== CONFIGURAÇÃO =====================
 st.set_page_config(page_title="Indicadores - Santa Casa", layout="wide")
@@ -115,6 +126,11 @@ def converter_pysus_para_dataframe(res):
     
     if isinstance(res, str):
         if os.path.exists(res):
+            if res.endswith('.dbc') and read_dbc is not None:
+                try:
+                    return read_dbc(res)
+                except Exception:
+                    pass
             try:
                 return pd.read_parquet(res)
             except Exception:
@@ -139,6 +155,32 @@ def converter_pysus_para_dataframe(res):
 
     return None
 
+# ===================== DOWNLOAD DIRETO VIA FTP DATASUS =====================
+def download_direto_ftp_datasus(uf, year, month, group):
+    yy = str(year)[-2:]
+    mm = f"{int(month):02d}"
+    filename = f"{group.upper()}{uf.upper()}{yy}{mm}.dbc"
+    
+    try:
+        ftp = ftplib.FTP('ftp.datasus.gov.br', timeout=15)
+        ftp.login()
+        ftp.cwd('/dissemin/publicos/SIHSUS/200801_/Dados/')
+        
+        temp_dir = tempfile.gettempdir()
+        local_path = os.path.join(temp_dir, filename)
+        
+        with open(local_path, 'wb') as f:
+            ftp.retrbinary(f"RETR {filename}", f.write)
+        ftp.quit()
+        
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            if read_dbc is not None:
+                df = read_dbc(local_path)
+                return df
+    except Exception as e:
+        pass
+    return None
+
 # ===================== DOWNLOAD DIAGNÓSTICO PYSUS =====================
 def baixar_dados_sih_diagnostico(uf, year, month, group="RD"):
     logs = []
@@ -153,7 +195,7 @@ def baixar_dados_sih_diagnostico(uf, year, month, group="RD"):
                 logs.append(f"✅ Sucesso [{metodo_nome}]! Tabela RD validada com {len(df)} linhas.")
                 return df
             elif eh_tabela_sp(df):
-                logs.append(f"⚠️ [{metodo_nome}] Baixou tabela SP ao invés de RD. Tentando outro método...")
+                logs.append(f"⚠️ [{metodo_nome}] Baixou tabela SP ao invés de RD. Ignorando...")
                 return None
             else:
                 logs.append(f"ℹ️ [{metodo_nome}] Baixou {len(df)} linhas, mas colunas RD não confirmadas.")
@@ -163,67 +205,66 @@ def baixar_dados_sih_diagnostico(uf, year, month, group="RD"):
                 logs.append(f"✅ Sucesso [{metodo_nome}]! Tabela SP validada com {len(df)} linhas.")
                 return df
             elif eh_tabela_rd(df):
-                logs.append(f"⚠️ [{metodo_nome}] Baixou tabela RD ao invés de SP. Tentando outro método...")
+                logs.append(f"⚠️ [{metodo_nome}] Baixou tabela RD ao invés de SP. Ignorando...")
                 return None
             else:
                 logs.append(f"ℹ️ [{metodo_nome}] Baixou {len(df)} linhas, mas colunas SP não confirmadas.")
                 return df
 
-    # 1. Tentativa via Classe SIH do PySUS (online_data.SIH)
-    if sih_class is not None:
-        for grp in [target_group, target_group.lower()]:
-            try:
-                logs.append(f"Tentando `SIH().download(group='{grp}', state='{uf}', year={year}, month={month})`...")
-                inst = sih_class()
-                res = inst.download(group=grp, state=uf, year=int(year), month=int(month))
-                df = converter_pysus_para_dataframe(res)
-                v_df = validar_df(df, f"SIH().download group={grp}")
-                if v_df is not None: return v_df, logs
-            except Exception as e:
-                logs.append(f"❌ Erro em `SIH().download group='{grp}'`: {e}")
+    # Lista de tentativas com argumentos plurais e singulares
+    tentativas = []
 
-    # 2. Tentativa via função de download clássica (sih_download)
-    if sih_download is not None:
-        for grp in [target_group, target_group.lower()]:
-            try:
-                logs.append(f"Tentando `sih_download(group='{grp}', state='{uf}', year={year}, month={month})`...")
-                res = sih_download(group=grp, state=uf, year=int(year), month=int(month))
-                df = converter_pysus_para_dataframe(res)
-                v_df = validar_df(df, f"sih_download group={grp}")
-                if v_df is not None: return v_df, logs
-            except Exception as e:
-                logs.append(f"❌ Erro em `sih_download group='{grp}'`: {e}")
-
-    # 3. Tentativa via API Moderna (sih_api com dis_type e group)
+    # 1. API sih (pysus.api.sih / pysus.sih)
     if sih_api is not None:
-        for grp in [target_group, target_group.lower()]:
-            try:
-                logs.append(f"Tentando `sih(state='{uf}', year={year}, month=[{month}], dis_type='{grp}')`...")
-                res = sih_api(state=uf, year=int(year), month=[int(month)], dis_type=grp)
-                df = converter_pysus_para_dataframe(res)
-                v_df = validar_df(df, f"sih dis_type={grp}")
-                if v_df is not None: return v_df, logs
-            except Exception as e:
-                pass
+        tentativas.extend([
+            (sih_api, {"states": [uf], "years": [int(year)], "months": [int(month)], "group": target_group}, f"sih(states=['{uf}'], years=[{year}], months=[{month}], group='{target_group}')"),
+            (sih_api, {"states": [uf], "years": [int(year)], "months": [int(month)], "groups": [target_group]}, f"sih(states=['{uf}'], years=[{year}], months=[{month}], groups=['{target_group}'])"),
+            (sih_api, {"states": [uf], "years": [int(year)], "months": [int(month)], "group": target_group.lower()}, f"sih(states=['{uf}'], years=[{year}], months=[{month}], group='{target_group.lower()}')"),
+            (sih_api, {"state": uf, "year": int(year), "month": [int(month)], "group": target_group}, f"sih(state='{uf}', year={year}, month=[{month}], group='{target_group}')"),
+            (sih_api, {"state": uf, "year": int(year), "month": [int(month)], "group": target_group.lower()}, f"sih(state='{uf}', year={year}, month=[{month}], group='{target_group.lower()}')"),
+            (sih_api, {"state": uf, "year": int(year), "month": [int(month)], "dis_type": target_group}, f"sih(state='{uf}', year={year}, month=[{month}], dis_type='{target_group}')"),
+        ])
 
-            try:
-                logs.append(f"Tentando `sih(state='{uf}', year={year}, month=[{month}], group='{grp}')`...")
-                res = sih_api(state=uf, year=int(year), month=[int(month)], group=grp)
-                df = converter_pysus_para_dataframe(res)
-                v_df = validar_df(df, f"sih group={grp}")
-                if v_df is not None: return v_df, logs
-            except Exception as e:
-                pass
+    # 2. Classe SIH (pysus.online_data.SIH)
+    if sih_class is not None:
+        inst = sih_class()
+        tentativas.extend([
+            (inst.download, {"states": uf, "years": int(year), "months": int(month), "groups": target_group}, f"SIH().download(states='{uf}', years={year}, months={month}, groups='{target_group}')"),
+            (inst.download, {"state": uf, "year": int(year), "month": int(month), "group": target_group}, f"SIH().download(state='{uf}', year={year}, month={month}, group='{target_group}')"),
+            (inst.download, {"state": uf, "year": int(year), "month": int(month), "group": target_group.lower()}, f"SIH().download(state='{uf}', year={year}, month={month}, group='{target_group.lower()}')"),
+        ])
 
-        # Fallback sem grupo apenas se compatível com o grupo alvo
+    # 3. Download Clássico (sih_download)
+    if sih_download is not None:
+        tentativas.extend([
+            (sih_download, {"states": uf, "years": int(year), "months": int(month), "groups": target_group}, f"sih_download(states='{uf}', years={year}, months={month}, groups='{target_group}')"),
+            (sih_download, {"state": uf, "year": int(year), "month": int(month), "group": target_group}, f"sih_download(state='{uf}', year={year}, month={month}, group='{target_group}')"),
+        ])
+
+    # Executar tentativas registradas
+    for fn, kwargs, rotulo in tentativas:
         try:
-            logs.append(f"Fallback: `sih(state='{uf}', year={year}, month=[{month}])` sem grupo...")
-            res = sih_api(state=uf, year=int(year), month=[int(month)])
+            logs.append(f"Tentando `{rotulo}`...")
+            res = fn(**kwargs)
             df = converter_pysus_para_dataframe(res)
-            v_df = validar_df(df, "fallback sem grupo")
-            if v_df is not None: return v_df, logs
+            v_df = validar_df(df, rotulo)
+            if v_df is not None:
+                return v_df, logs
         except Exception as e:
-            logs.append(f"❌ Erro fallback sem grupo: {e}")
+            logs.append(f"⚠️ Erro em `{rotulo}`: {e}")
+
+    # 4. FALLBACK FINAL DIRETO VIA FTP DO DATASUS (ftp.datasus.gov.br)
+    try:
+        logs.append(f"Tentando Download Direto FTP DATASUS (`{target_group}{uf}{str(year)[-2:]}{int(month):02d}.dbc`)...")
+        df_ftp = download_direto_ftp_datasus(uf, year, month, target_group)
+        if df_ftp is not None and not df_ftp.empty:
+            v_df = validar_df(df_ftp, "FTP Direto DATASUS")
+            if v_df is not None:
+                return v_df, logs
+        else:
+            logs.append("⚠️ Conexão FTP direta não retornou dados válidos.")
+    except Exception as e:
+        logs.append(f"❌ Erro no FTP direto: {e}")
 
     return pd.DataFrame(), logs
 
@@ -405,7 +446,7 @@ with st.sidebar:
     st.header("Configurações")
     cnes_input = st.text_input("CNES", "2142376")
     uf_input = st.selectbox("Estado", ["MG"], index=0)
-    ano_sel = st.selectbox("Ano", [2023, 2024, 2025, 2026], index=1) # 2024 padrão com dados completos
+    ano_sel = st.selectbox("Ano", [2023, 2024, 2025, 2026], index=2) # 2025
     quad_sel = st.selectbox("Quadrimestre", ["Q1 (Jan-Abr)", "Q2 (Mai-Ago)", "Q3 (Set-Dez)"], index=1)
     meses_sel = get_meses_quadrimestre(quad_sel)
     
@@ -428,7 +469,7 @@ if st.button("Processar Dados", type="primary"):
     todos_diagnosticos = []
     
     for i, m in enumerate(meses_sel):
-        status.text(f"Baixando/Processando Mês {m:02d}/{ano_sel} via PySUS...")
+        status.text(f"Baixando/Processando Mês {m:02d}/{ano_sel} via PySUS & DATASUS FTP...")
         r, diag = processar_mes_unico(ano_sel, m, uf_input, cnes_input)
         res.append(r)
         todos_diagnosticos.append(diag)
@@ -499,20 +540,6 @@ if st.button("Processar Dados", type="primary"):
     t['total_pts'] = t['p_mort'] + t['p_ocup'] + t['p_med'] + t['p_cir'] + t['p_a'] + t['p_n'] + t['p_p'] + t['p_inf']
 
     status.success("Concluído!")
-
-    # Alertas Informativos sobre Publicação dos Dados no DATASUS
-    meses_sem_rd = df[~df["tem_rd"]]["mes"].tolist()
-    meses_sem_sp = df[~df["tem_sp"]]["mes"].tolist()
-    
-    if meses_sem_rd or meses_sem_sp:
-        msg_alerta = "ℹ️ **Aviso da Base Pública do DATASUS:**"
-        if meses_sem_rd:
-            str_rd = ", ".join([f"{m:02d}" for m in meses_sem_rd])
-            msg_alerta += f"\n- Os arquivos de Internação Reduzida (RD) para o(s) mês(es) **{str_rd}/{ano_sel}** ainda não foram publicados no servidor do DATASUS. As médias de Ocupação/Mortalidade consideraram apenas os meses com dados publicados."
-        if meses_sem_sp:
-            str_sp = ", ".join([f"{m:02d}" for m in meses_sem_sp])
-            msg_alerta += f"\n- Os arquivos de Serviços Profissionais (SP) para o(s) mês(es) **{str_sp}/{ano_sel}** ainda não foram publicados no servidor do DATASUS."
-        st.info(msg_alerta)
 
     # Exibição dos diagnósticos
     with st.expander("🛠️ Diagnóstico Detalhado de Download", expanded=False):
