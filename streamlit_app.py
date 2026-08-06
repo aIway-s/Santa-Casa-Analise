@@ -6,7 +6,7 @@ import calendar
 import io
 import numpy as np
 
-# Novo import do PySUS 2.0
+# Import do PySUS 2.7.0 (Nova API)
 from pysus import sih
 
 # ===================== CONFIGURAÇÃO =====================
@@ -74,7 +74,7 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
     
     # ------------------- 1. RD (Lógica Mista) -------------------
     try:
-        # Nova chamada direta do PySUS 2.0
+        # Nova chamada direta da API do PySUS 2.7.0+
         df_rd = sih(state=uf, year=year, month=month, group="RD", as_dataframe=True)
         
         if df_rd is not None and not df_rd.empty:
@@ -131,7 +131,6 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
 
     # ------------------- 2. SP (UTIs) -------------------
     try:
-        # Nova chamada direta do PySUS 2.0
         df_sp = sih(state=uf, year=year, month=month, group="SP", as_dataframe=True)
         
         if df_sp is not None and not df_sp.empty:
