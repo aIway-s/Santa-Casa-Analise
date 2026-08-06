@@ -3,4 +3,4 @@ pandas
 matplotlib
 numpy
 loguru
-pysus
+pysus==2.3.0
