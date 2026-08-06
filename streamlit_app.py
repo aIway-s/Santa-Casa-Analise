@@ -6,9 +6,8 @@ import calendar
 import io
 import traceback
 
-# Importa a API nova e a clássica via FTP como plano B
+# Import exclusivo da API moderna do PySUS
 from pysus import sih
-from pysus.online_data.SIH import download as baixar_sih_ftp
 
 # ===================== CONFIGURAÇÃO =====================
 st.set_page_config(page_title="Indicadores - Santa Casa", layout="wide")
@@ -68,25 +67,14 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
     # ------------------- 1. RD (Lógica Mista) -------------------
     df_rd = pd.DataFrame()
     try:
-        # Tentativa 1: API Nova (DuckLake). Exige inteiros em formato de lista.
-        df_rd = sih(state=uf, year=year, month=[int(month)]) 
-    except Exception:
-        pass
-    
-    # Se a API nova falhar ou retornar vazio, aciona o Fallback do FTP
-    if df_rd is None or df_rd.empty:
-        try:
-            res_rd = baixar_sih_ftp(states=[uf], years=[year], months=[int(month)], groups=["RD"])
-            if isinstance(res_rd, (list, tuple)) and len(res_rd) > 0:
-                df_rd = pd.concat(res_rd, ignore_index=True)
-            elif not isinstance(res_rd, (list, tuple)):
-                df_rd = res_rd
-        except Exception as e:
-            st.error(f"Falha no FTP para RD ({month}/{year}): {e}")
+        # API moderna com inteiros em lista e as_dataframe=True
+        df_rd = sih(state=uf, year=year, month=[int(month)], group="RD", as_dataframe=True) 
+    except Exception as e:
+        st.error(f"Falha na API para RD ({month}/{year}): {e}")
 
     with st.expander(f"🕵️ Log de Extração: RD - {month}/{year}", expanded=False):
         if df_rd is None or df_rd.empty:
-            st.warning("Ambas as APIs retornaram VAZIO para RD.")
+            st.warning(f"O PySUS retornou VAZIO para RD no mês {month}/{year}. É possível que os dados ainda não estejam disponíveis na nuvem do DATASUS.")
         else:
             st.success(f"Sucesso! Baixadas {len(df_rd)} linhas.")
 
@@ -131,24 +119,13 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
     # ------------------- 2. SP (UTIs) -------------------
     df_sp = pd.DataFrame()
     try:
-        # A API simplificada pode não suportar filtros de grupo ainda, então caímos direto pro FTP se falhar
-        df_sp = sih(state=uf, year=year, month=[int(month)], group="SP")
-    except Exception:
-        pass
-
-    if df_sp is None or df_sp.empty:
-        try:
-            res_sp = baixar_sih_ftp(states=[uf], years=[year], months=[int(month)], groups=["SP"])
-            if isinstance(res_sp, (list, tuple)) and len(res_sp) > 0:
-                df_sp = pd.concat(res_sp, ignore_index=True)
-            elif not isinstance(res_sp, (list, tuple)):
-                df_sp = res_sp
-        except Exception as e:
-            st.error(f"Falha no FTP para SP ({month}/{year}): {e}")
+        df_sp = sih(state=uf, year=year, month=[int(month)], group="SP", as_dataframe=True)
+    except Exception as e:
+        st.error(f"Falha na API para SP ({month}/{year}): {e}")
 
     with st.expander(f"🕵️ Log de Extração: SP - {month}/{year}", expanded=False):
         if df_sp is None or df_sp.empty:
-            st.warning("Ambas as APIs retornaram VAZIO para SP.")
+            st.warning(f"O PySUS retornou VAZIO para SP no mês {month}/{year}. É possível que os dados ainda não estejam disponíveis na nuvem do DATASUS.")
         else:
             st.success(f"Sucesso! Baixadas {len(df_sp)} linhas.")
 
