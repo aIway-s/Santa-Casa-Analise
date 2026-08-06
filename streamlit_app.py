@@ -8,6 +8,7 @@ import os
 import ftplib
 import tempfile
 import traceback
+import gc
 
 # Importações do PySUS com tratamento de avisos do Pylance / VS Code
 sih_api = None
@@ -25,7 +26,6 @@ except Exception as e1:
 sih_download = None
 sih_class = None
 parquets_to_dataframe = None
-read_dbc = None
 
 try:
     from pysus.online_data.SIH import download as sih_download  # type: ignore
@@ -40,17 +40,6 @@ except Exception:
 
 read_dbc = None
 dbc2dbf = None
-
-# Tentar importar do pyreaddbc (AlertaDengue)
-try:
-    from pyreaddbc import read_dbc  # type: ignore
-except Exception:
-    pass
-
-try:
-    from pyreaddbc import dbc2dbf  # type: ignore
-except Exception:
-    pass
 
 # Tentar submódulos do PySUS caso pyreaddbc não esteja disponível
 modules_to_check = [
@@ -373,12 +362,13 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
         
         cnes_c = encontrar_coluna(df_rd, ["CNES", "CNES_EXEC", "CODUFMUN", "SP_CNES"])
         if cnes_c and cnes_c in df_rd.columns:
-            col_cnes_vals = df_rd[cnes_c].astype(str).str.replace(r"\D", "", regex=True)
-            diag_info["cnes_encontrados_rd"] = list(col_cnes_vals.unique()[:10])
-            
-            cnes_col_str = col_cnes_vals.str.zfill(7)
-            df_rd_filtered = df_rd[(cnes_col_str == cnes_alvo_str) | (pd.to_numeric(df_rd[cnes_c], errors='coerce') == cnes_alvo_int)].copy()
+            s_cnes_rd = df_rd[cnes_c].astype(str).str.strip()
+            diag_info["cnes_encontrados_rd"] = list(s_cnes_rd.unique()[:10])
+            mask_rd = (s_cnes_rd == cnes_alvo_str) | (s_cnes_rd.str.zfill(7) == cnes_alvo_str)
+            df_rd_filtered = df_rd[mask_rd].copy()
             diag_info["total_rd_cnes"] = len(df_rd_filtered)
+            del df_rd, s_cnes_rd, mask_rd
+            gc.collect()
             
             if not df_rd_filtered.empty:
                 d["tem_rd"] = True
@@ -426,10 +416,12 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
         
         cnes_s = encontrar_coluna(df_sp, ["CNES", "SP_CNES", "CNES_EXEC", "CODUFMUN"])
         if cnes_s and cnes_s in df_sp.columns:
-            col_cnes_sp = df_sp[cnes_s].astype(str).str.replace(r"\D", "", regex=True)
-            cnes_sp_str = col_cnes_sp.str.zfill(7)
-            df_sp_filtered = df_sp[(cnes_sp_str == cnes_alvo_str) | (pd.to_numeric(df_sp[cnes_s], errors='coerce') == cnes_alvo_int)].copy()
+            s_cnes_sp = df_sp[cnes_s].astype(str).str.strip()
+            mask_sp = (s_cnes_sp == cnes_alvo_str) | (s_cnes_sp.str.zfill(7) == cnes_alvo_str)
+            df_sp_filtered = df_sp[mask_sp].copy()
             diag_info["total_sp_cnes"] = len(df_sp_filtered)
+            del df_sp, s_cnes_sp, mask_sp
+            gc.collect()
             
             if not df_sp_filtered.empty:
                 d["tem_sp"] = True
