@@ -67,7 +67,7 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
     
     # ------------------- 1. RD (Lógica Mista) -------------------
     try:
-        df_rd = sih(state=uf, year=year, month=month, group="RD", as_dataframe=True)
+        df_rd = sih(state=uf, year=year, month=f"{month:02d}", group="RD", as_dataframe=True)
         
         # DEBUG NA TELA: O que o PySUS retornou de verdade?
         with st.expander(f"🕵️ Log de Extração: RD - {month}/{year}", expanded=True):
@@ -127,7 +127,7 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
 
     # ------------------- 2. SP (UTIs) -------------------
     try:
-        df_sp = sih(state=uf, year=year, month=month, group="SP", as_dataframe=True)
+        df_sp = sih(state=uf, year=year, month=f"{month:02d}", group="SP", as_dataframe=True)
         
         # DEBUG NA TELA: O que o PySUS retornou de verdade?
         with st.expander(f"🕵️ Log de Extração: SP - {month}/{year}", expanded=True):
