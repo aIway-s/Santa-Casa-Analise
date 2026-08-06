@@ -60,7 +60,7 @@ for mod_path in modules_to_check:
     except Exception:
         pass
 
-def ler_arquivo_dbc(filepath):
+def ler_arquivo_dbc(filepath, cnes_filter=None):
     if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
         return None
 
@@ -69,7 +69,7 @@ def ler_arquivo_dbc(filepath):
 
     # 1. Tentar via datasus-dbc (Motor em Rust: rápido e sem dependências de compilação C)
     try:
-        import datasus_dbc
+        import datasus_dbc  # type: ignore
         datasus_dbc.decompress(filepath, temp_dbf)
         if os.path.exists(temp_dbf) and os.path.getsize(temp_dbf) > 0:
             descompactado = True
@@ -96,27 +96,41 @@ def ler_arquivo_dbc(filepath):
         except Exception:
             pass
 
-    # 4. Tentar via read_dbc direto
-    if not descompactado and read_dbc is not None:
-        try:
-            df = read_dbc(filepath)
-            if df is not None and not df.empty:
-                return df
-        except Exception:
-            pass
-
-    # Se descompactou com sucesso para DBF, converter em DataFrame via dbfread
+    # Se descompactou com sucesso para DBF, converter em DataFrame filtrando LINHA A LINHA por CNES
     if descompactado and os.path.exists(temp_dbf):
         try:
             from dbfread import DBF  # type: ignore
             table = DBF(temp_dbf, encoding='iso-8859-1', ignore_missing_memofile=True)
-            df = pd.DataFrame(iter(table))
+            
+            cnes_alvo_str = str(cnes_filter).strip().zfill(7) if cnes_filter else None
+            cnes_alvo_int = int(str(cnes_filter).strip()) if (cnes_filter and str(cnes_filter).strip().isdigit()) else None
+            
+            registros = []
+            for record in table:
+                if cnes_alvo_str:
+                    cnes_val = str(record.get('CNES') or record.get('SP_CNES') or record.get('CNES_EXEC') or record.get('CODUFMUN') or '').strip()
+                    cnes_clean = cnes_val.replace('.0', '').zfill(7)
+                    if cnes_clean != cnes_alvo_str:
+                        if cnes_alvo_int is not None:
+                            try:
+                                if int(float(cnes_val)) != cnes_alvo_int:
+                                    continue
+                            except Exception:
+                                continue
+                        else:
+                            continue
+                
+                # Manter apenas colunas essenciais
+                reg_filtrado = {k: v for k, v in record.items() if str(k).upper().strip() in COLUNAS_ESSENCIAIS}
+                registros.append(reg_filtrado)
+
             try:
                 os.remove(temp_dbf)
             except Exception:
                 pass
-            if df is not None and not df.empty:
-                return df
+                
+            df = pd.DataFrame(registros)
+            return otimizar_dataframe_memoria(df) if df is not None and not df.empty else pd.DataFrame()
         except Exception:
             if os.path.exists(temp_dbf):
                 try:
@@ -124,9 +138,19 @@ def ler_arquivo_dbc(filepath):
                 except Exception:
                     pass
 
+    # 4. Tentar via read_dbc direto
+    if not descompactado and read_dbc is not None:
+        try:
+            df = read_dbc(filepath)
+            if df is not None and not df.empty:
+                return otimizar_dataframe_memoria(df)
+        except Exception:
+            pass
+
     # 5. Fallback: verificar se é Parquet disfarçado
     try:
-        return pd.read_parquet(filepath)
+        df = pd.read_parquet(filepath)
+        return otimizar_dataframe_memoria(df)
     except Exception:
         pass
 
@@ -270,7 +294,7 @@ def converter_pysus_para_dataframe(res):
     return None
 
 # ===================== DOWNLOAD DIRETO VIA FTP DATASUS =====================
-def download_direto_ftp_datasus(uf, year, month, group):
+def download_direto_ftp_datasus(uf, year, month, group, cnes_filter=None):
     yy = str(year)[-2:]
     mm = f"{int(month):02d}"
     
@@ -293,13 +317,14 @@ def download_direto_ftp_datasus(uf, year, month, group):
                 with open(local_path, 'wb') as f:
                     ftp.retrbinary(f"RETR {fname}", f.write)
                 if os.path.exists(local_path) and os.path.getsize(local_path) > 100:
-                    df = ler_arquivo_dbc(local_path)
-                    if df is not None and not df.empty:
+                    df = ler_arquivo_dbc(local_path, cnes_filter=cnes_filter)
+                    try:
+                        os.remove(local_path)
+                    except Exception:
+                        pass
+                    if df is not None:
                         ftp.quit()
                         return df, f"Baixou e descompactou {fname} com sucesso ({len(df)} linhas)"
-                    else:
-                        ftp.quit()
-                        return None, f"Baixou {fname} do FTP (tamanho ok), mas não conseguiu descompactar com ler_arquivo_dbc"
             except Exception:
                 continue
                 
@@ -309,7 +334,7 @@ def download_direto_ftp_datasus(uf, year, month, group):
         return None, f"Erro na conexão FTP: {e}"
 
 # ===================== DOWNLOAD DIAGNÓSTICO PYSUS =====================
-def baixar_dados_sih_diagnostico(uf, year, month, group="RD"):
+def baixar_dados_sih_diagnostico(uf, year, month, group="RD", cnes_filter=None):
     logs = []
     target_group = group.upper().strip()
     
@@ -338,38 +363,26 @@ def baixar_dados_sih_diagnostico(uf, year, month, group="RD"):
                 logs.append(f"ℹ️ [{metodo_nome}] Baixou {len(df)} linhas, mas colunas SP não confirmadas.")
                 return df
 
-    # Lista de tentativas
-    tentativas = []
+    # 1. PRIORIDADE 1: DOWNLOAD DIRETO FTP DATASUS (Rápido, ultra leve, filtrado linha a linha e sem estouro de RAM)
+    try:
+        logs.append(f"Tentando Download Direto FTP DATASUS (`{target_group}{uf}{str(year)[-2:]}{int(month):02d}.DBC`)...")
+        df_ftp, msg_ftp = download_direto_ftp_datasus(uf, year, month, target_group, cnes_filter=cnes_filter)
+        logs.append(f"ℹ️ [{target_group}] FTP DATASUS: {msg_ftp}")
+        if df_ftp is not None and not df_ftp.empty:
+            v_df = validar_df(df_ftp, "FTP Direto DATASUS")
+            if v_df is not None:
+                return v_df, logs
+    except Exception as e:
+        logs.append(f"❌ Erro no FTP direto: {e}")
 
-    # 1. API sih com argumentos POSICIONAIS e NOMINAIS
+    # 2. FALLBACK: API PySUS (Caso o FTP oficial falhe)
+    tentativas = []
     if sih_api is not None:
         tentativas.extend([
-            # Argumentos posicionais (soluciona o erro missing positional arguments)
             (sih_api, (uf, int(year), int(month), target_group), {}, f"sih('{uf}', {year}, {month}, '{target_group}')"),
-            (sih_api, (uf, int(year), [int(month)], target_group), {}, f"sih('{uf}', {year}, [{month}], '{target_group}')"),
-            (sih_api, (uf, [int(year)], [int(month)], target_group), {}, f"sih('{uf}', [{year}], [{month}], '{target_group}')"),
-            (sih_api, (uf, int(year), int(month)), {"group": target_group}, f"sih('{uf}', {year}, {month}, group='{target_group}')"),
             (sih_api, (uf, int(year), int(month)), {"dis_type": target_group}, f"sih('{uf}', {year}, {month}, dis_type='{target_group}')"),
-            # Argumentos nominais
-            (sih_api, (), {"state": uf, "year": int(year), "month": int(month), "group": target_group}, f"sih(state='{uf}', year={year}, month={month}, group='{target_group}')"),
-            (sih_api, (), {"state": uf, "year": int(year), "month": [int(month)], "group": target_group}, f"sih(state='{uf}', year={year}, month=[{month}], group='{target_group}')"),
         ])
 
-    # 2. Classe SIH (pysus.online_data.SIH)
-    if sih_class is not None:
-        inst = sih_class()
-        tentativas.extend([
-            (inst.download, (uf, int(year), int(month)), {"group": target_group}, f"SIH().download('{uf}', {year}, {month}, group='{target_group}')"),
-            (inst.download, (), {"state": uf, "year": int(year), "month": int(month), "group": target_group}, f"SIH().download(state='{uf}', year={year}, month={month}, group='{target_group}')"),
-        ])
-
-    # 3. Download Clássico (sih_download)
-    if sih_download is not None:
-        tentativas.extend([
-            (sih_download, (uf, int(year), int(month)), {"group": target_group}, f"sih_download('{uf}', {year}, {month}, group='{target_group}')"),
-        ])
-
-    # Executar tentativas registradas
     for fn, args, kwargs, rotulo in tentativas:
         try:
             logs.append(f"Tentando `{rotulo}`...")
@@ -380,18 +393,6 @@ def baixar_dados_sih_diagnostico(uf, year, month, group="RD"):
                 return v_df, logs
         except Exception as e:
             logs.append(f"⚠️ Erro em `{rotulo}`: {e}")
-
-    # 4. FALLBACK FINAL DIRETO VIA FTP DO DATASUS (ftp.datasus.gov.br)
-    try:
-        logs.append(f"Tentando Download Direto FTP DATASUS (`{target_group}{uf}{str(year)[-2:]}{int(month):02d}.DBC`)...")
-        df_ftp, msg_ftp = download_direto_ftp_datasus(uf, year, month, target_group)
-        logs.append(f"ℹ️ [{target_group}] FTP DATASUS: {msg_ftp}")
-        if df_ftp is not None and not df_ftp.empty:
-            v_df = validar_df(df_ftp, "FTP Direto DATASUS")
-            if v_df is not None:
-                return v_df, logs
-    except Exception as e:
-        logs.append(f"❌ Erro no FTP direto: {e}")
 
     return pd.DataFrame(), logs
 
@@ -414,7 +415,7 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
     diag_info = {"month": month, "logs_rd": [], "logs_sp": [], "total_rd_bruto": 0, "total_rd_cnes": 0, "cnes_encontrados_rd": [], "total_sp_bruto": 0, "total_sp_cnes": 0, "colunas_rd": [], "colunas_sp": []}
 
     # ------------------- 1. RD (Hospitalizações Reduzidas) -------------------
-    df_rd, logs_rd = baixar_dados_sih_diagnostico(uf=uf, year=year, month=month, group="RD")
+    df_rd, logs_rd = baixar_dados_sih_diagnostico(uf=uf, year=year, month=month, group="RD", cnes_filter=cnes_filter)
     diag_info["logs_rd"] = logs_rd
 
     if df_rd is not None and not df_rd.empty:
@@ -468,7 +469,7 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
                     d["saidas_cir"] = len(df_cir_saidas)
 
     # ------------------- 2. SP (UTIs) -------------------
-    df_sp, logs_sp = baixar_dados_sih_diagnostico(uf=uf, year=year, month=month, group="SP")
+    df_sp, logs_sp = baixar_dados_sih_diagnostico(uf=uf, year=year, month=month, group="SP", cnes_filter=cnes_filter)
     diag_info["logs_sp"] = logs_sp
 
     if df_sp is not None and not df_sp.empty:
