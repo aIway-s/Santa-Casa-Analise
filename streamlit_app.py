@@ -56,11 +56,13 @@ def encontrar_coluna(df, candidatos):
     if df is None or df.empty: return None
     cols_upper = [str(c).upper().strip() for c in df.columns]
     for termo in candidatos:
+        t_up = termo.upper().strip()
         for i, col in enumerate(cols_upper):
-            if termo == col: return df.columns[i]
+            if t_up == col: return df.columns[i]
     for termo in candidatos:
+        t_up = termo.upper().strip()
         for i, col in enumerate(cols_upper):
-            if termo in col: return df.columns[i]
+            if t_up in col: return df.columns[i]
     return None
 
 def get_days_in_month(year, month):
@@ -156,17 +158,7 @@ def baixar_dados_sih_diagnostico(uf, year, month, group="RD"):
             except Exception as e:
                 pass
 
-            # Variação C: sih(uf, year, month, grp) posicionais
-            try:
-                res = sih_api(uf, int(year), int(month), grp)
-                df = converter_pysus_para_dataframe(res)
-                if df is not None and not df.empty:
-                    logs.append(f"✅ Sucesso via PySUS API posicional! {len(df)} linhas.")
-                    return df, logs
-            except Exception as e:
-                pass
-
-        # Variação D: sih(state=uf, year=year, month=[month]) sem especificar group
+        # Variação C: sih(state=uf, year=year, month=[month]) sem especificar group
         try:
             logs.append(f"Tentando `sih(state='{uf}', year={year}, month=[{month}])` sem grupo...")
             res = sih_api(state=uf, year=int(year), month=[int(month)])
@@ -212,7 +204,7 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
     cnes_alvo_str = str(cnes_filter).strip().zfill(7)
     cnes_alvo_int = int(str(cnes_filter).strip()) if str(cnes_filter).strip().isdigit() else 0
     
-    diag_info = {"month": month, "logs_rd": [], "logs_sp": [], "total_rd_bruto": 0, "total_rd_cnes": 0, "cnes_encontrados_rd": [], "total_sp_bruto": 0, "total_sp_cnes": 0}
+    diag_info = {"month": month, "logs_rd": [], "logs_sp": [], "total_rd_bruto": 0, "total_rd_cnes": 0, "cnes_encontrados_rd": [], "total_sp_bruto": 0, "total_sp_cnes": 0, "colunas_rd": [], "colunas_sp": []}
 
     # ------------------- 1. RD (Hospitalizações Reduzidas) -------------------
     df_rd, logs_rd = baixar_dados_sih_diagnostico(uf=uf, year=year, month=month, group="RD")
@@ -221,9 +213,10 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
     if df_rd is not None and not df_rd.empty:
         diag_info["total_rd_bruto"] = len(df_rd)
         df_rd.columns = [str(c).upper().strip() for c in df_rd.columns]
+        diag_info["colunas_rd"] = list(df_rd.columns)[:15]
         
-        cnes_c = encontrar_coluna(df_rd, ["CNES", "CNES_EXEC", "CODUFMUN"])
-        if cnes_c:
+        cnes_c = encontrar_coluna(df_rd, ["CNES", "CNES_EXEC", "CODUFMUN", "SP_CNES"])
+        if cnes_c and cnes_c in df_rd.columns:
             col_cnes_vals = df_rd[cnes_c].astype(str).str.replace(r"\D", "", regex=True)
             diag_info["cnes_encontrados_rd"] = list(col_cnes_vals.unique()[:10])
             
@@ -233,32 +226,35 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
             
             if not df_rd_filtered.empty:
                 df_rd = df_rd_filtered
-                c_morte = encontrar_coluna(df_rd, ["MORTE", "OBITO"])
-                c_dias = encontrar_coluna(df_rd, ["DIAS_PERM", "QT_DIARIAS"])
-                c_espec = encontrar_coluna(df_rd, ["ESPEC", "COD_ESPEC"])
-                c_motivo = encontrar_coluna(df_rd, ["COBRANCA", "MOT_SAIDA", "COBRA_SAI"])
+                c_morte = encontrar_coluna(df_rd, ["MORTE", "OBITO", "DIAG_OBITO"])
+                c_dias = encontrar_coluna(df_rd, ["DIAS_PERM", "QT_DIARIAS", "DIAS"])
+                c_espec = encontrar_coluna(df_rd, ["ESPEC", "COD_ESPEC", "ESPECIAL"])
+                c_motivo = encontrar_coluna(df_rd, ["COBRANCA", "MOT_SAIDA", "COBRA_SAI", "MOTIV_SAI"])
 
-                if c_morte: df_rd[c_morte] = pd.to_numeric(df_rd[c_morte], errors='coerce').fillna(0).astype(int)
-                if c_dias: df_rd[c_dias] = pd.to_numeric(df_rd[c_dias], errors='coerce').fillna(0).astype(int)
+                if c_morte and c_morte in df_rd.columns: 
+                    df_rd[c_morte] = pd.to_numeric(df_rd[c_morte], errors='coerce').fillna(0).astype(int)
+                if c_dias and c_dias in df_rd.columns: 
+                    df_rd[c_dias] = pd.to_numeric(df_rd[c_dias], errors='coerce').fillna(0).astype(int)
+                    df_rd = df_rd[df_rd[c_dias] >= 0].copy()
 
-                df_rd = df_rd[df_rd[c_dias] >= 0].copy()
-
-                if c_morte and c_dias:
+                if c_morte and c_dias and c_morte in df_rd.columns and c_dias in df_rd.columns:
                     d["saidas_tot"] = len(df_rd)
                     d["obitos_tot"] = int((df_rd[c_morte] == 1).sum())
                     d["dias_geral"] = int(df_rd[c_dias].sum())
 
-                if c_espec and c_motivo:
+                if c_espec and c_motivo and c_espec in df_rd.columns and c_motivo in df_rd.columns:
                     df_rd['ESPEC_STR'] = df_rd[c_espec].astype(str).str.split('.').str[0].str.strip().str.zfill(2)
                     df_rd['MOTIVO_INT'] = pd.to_numeric(df_rd[c_motivo], errors='coerce').fillna(0).astype(int)
                     
                     df_med_dias = df_rd[df_rd['ESPEC_STR'].isin(CODIGOS_ESPEC['MEDICA'])]
-                    d["dias_med"] = int(df_med_dias[c_dias].sum())
+                    if c_dias and c_dias in df_med_dias.columns:
+                        d["dias_med"] = int(df_med_dias[c_dias].sum())
                     df_med_saidas = df_med_dias[~df_med_dias['MOTIVO_INT'].isin(MOTIVOS_NAO_CONTAR_SAIDA)]
                     d["saidas_med"] = len(df_med_saidas)
                     
                     df_cir_dias = df_rd[df_rd['ESPEC_STR'].isin(CODIGOS_ESPEC['CIRURGICA'])]
-                    d["dias_cir"] = int(df_cir_dias[c_dias].sum())
+                    if c_dias and c_dias in df_cir_dias.columns:
+                        d["dias_cir"] = int(df_cir_dias[c_dias].sum())
                     df_cir_saidas = df_cir_dias[~df_cir_dias['MOTIVO_INT'].isin(MOTIVOS_NAO_CONTAR_SAIDA)]
                     d["saidas_cir"] = len(df_cir_saidas)
 
@@ -269,9 +265,10 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
     if df_sp is not None and not df_sp.empty:
         diag_info["total_sp_bruto"] = len(df_sp)
         df_sp.columns = [str(c).upper().strip() for c in df_sp.columns]
+        diag_info["colunas_sp"] = list(df_sp.columns)[:15]
         
-        cnes_s = encontrar_coluna(df_sp, ["CNES", "SP_CNES"])
-        if cnes_s:
+        cnes_s = encontrar_coluna(df_sp, ["CNES", "SP_CNES", "CNES_EXEC", "CODUFMUN"])
+        if cnes_s and cnes_s in df_sp.columns:
             col_cnes_sp = df_sp[cnes_s].astype(str).str.replace(r"\D", "", regex=True)
             cnes_sp_str = col_cnes_sp.str.zfill(7)
             df_sp_filtered = df_sp[(cnes_sp_str == cnes_alvo_str) | (pd.to_numeric(df_sp[cnes_s], errors='coerce') == cnes_alvo_int)].copy()
@@ -279,28 +276,34 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
             
             if not df_sp_filtered.empty:
                 df_sp = df_sp_filtered
-                c_ato = next((c for c in df_sp.columns if "ATOPROF" in c), "SP_ATOPROF")
-                c_qtd = next((c for c in df_sp.columns if "QT_" in c), "SP_QTD_ATO")
-                c_val = next((c for c in df_sp.columns if "VAL" in c), "SP_VALATO")
-                c_idade = next((c for c in df_sp.columns if "IDADE" in c or "NU_IDADE" in c), None)
-
-                df_sp[c_ato] = df_sp[c_ato].astype(str).str.strip().str.replace(r"[^0-9]", "", regex=True)
-                df_sp[c_qtd] = pd.to_numeric(df_sp[c_qtd], errors='coerce').fillna(0).astype(int)
-                df_sp[c_val] = pd.to_numeric(df_sp[c_val], errors='coerce').fillna(0.0)
                 
-                if c_idade: df_sp['IDADE_R'] = pd.to_numeric(df_sp[c_idade], errors='coerce').fillna(-1)
-                else: df_sp['IDADE_R'] = -1
+                c_ato = encontrar_coluna(df_sp, ["SP_ATOPROF", "SP_PROCDIG", "SP_COD_ATO", "SP_ATO", "ATOPROF", "PROCDIG", "COD_ATO", "PROCEDIMENTO"])
+                c_qtd = encontrar_coluna(df_sp, ["SP_QTD_ATO", "SP_QT_ATO", "SP_QTD", "QT_ATO", "QTD_ATO", "QT_PROCDIG", "QUANTIDADE"])
+                c_val = encontrar_coluna(df_sp, ["SP_VALATO", "SP_VAL_ATO", "SP_VALOR", "VAL_ATO", "VALOR_ATO", "VAL_PROCDIG", "VAL_TOT"])
+                c_idade = encontrar_coluna(df_sp, ["SP_IDADE", "IDADE", "NU_IDADE", "IDADE_PAC", "IDADE_PACIENTE"])
 
-                df_ok = df_sp[df_sp[c_val] > 0].copy()
-                
-                if not df_ok.empty:
-                    mask_a = (df_ok[c_ato] == '0802010083') & ((df_ok['IDADE_R'] >= 14) | (df_ok['IDADE_R'] == -1))
-                    mask_n = (df_ok[c_ato] == '0802010121') & ((df_ok['IDADE_R'] < 1) | (df_ok['IDADE_R'] == -1))
-                    mask_p = (df_ok[c_ato] == '0802010156')
+                if c_ato and c_qtd and c_val and c_ato in df_sp.columns and c_qtd in df_sp.columns and c_val in df_sp.columns:
+                    df_sp[c_ato] = df_sp[c_ato].astype(str).str.strip().str.replace(r"[^0-9]", "", regex=True)
+                    df_sp[c_qtd] = pd.to_numeric(df_sp[c_qtd], errors='coerce').fillna(0).astype(int)
+                    df_sp[c_val] = pd.to_numeric(df_sp[c_val], errors='coerce').fillna(0.0)
+                    
+                    if c_idade and c_idade in df_sp.columns: 
+                        df_sp['IDADE_R'] = pd.to_numeric(df_sp[c_idade], errors='coerce').fillna(-1)
+                    else: 
+                        df_sp['IDADE_R'] = -1
 
-                    d["dias_a"] = int(df_ok.loc[mask_a, c_qtd].sum()) if mask_a.any() else 0
-                    d["dias_n"] = int(df_ok.loc[mask_n, c_qtd].sum()) if mask_n.any() else 0
-                    d["dias_p"] = int(df_ok.loc[mask_p, c_qtd].sum()) if mask_p.any() else 0
+                    df_ok = df_sp[df_sp[c_val] > 0].copy()
+                    
+                    if not df_ok.empty:
+                        mask_a = (df_ok[c_ato] == '0802010083') & ((df_ok['IDADE_R'] >= 14) | (df_ok['IDADE_R'] == -1))
+                        mask_n = (df_ok[c_ato] == '0802010121') & ((df_ok['IDADE_R'] < 1) | (df_ok['IDADE_R'] == -1))
+                        mask_p = (df_ok[c_ato] == '0802010156')
+
+                        d["dias_a"] = int(df_ok.loc[mask_a, c_qtd].sum()) if mask_a.any() else 0
+                        d["dias_n"] = int(df_ok.loc[mask_n, c_qtd].sum()) if mask_n.any() else 0
+                        d["dias_p"] = int(df_ok.loc[mask_p, c_qtd].sum()) if mask_p.any() else 0
+                else:
+                    diag_info["logs_sp"].append(f"⚠️ Colunas de atos/quantidades de SP não localizadas com precisão. Colunas do DF: {list(df_sp.columns)}")
 
     d.update({"cap_geral": caps['geral'], "cap_a": caps['uti_a'], "cap_n": caps['uti_n'], "cap_p": caps['uti_p']})
     return d, diag_info
@@ -361,7 +364,7 @@ with st.sidebar:
     st.header("Configurações")
     cnes_input = st.text_input("CNES", "2142376")
     uf_input = st.selectbox("Estado", ["MG"], index=0)
-    ano_sel = st.selectbox("Ano", [2023, 2024, 2025, 2026], index=1) # 2024 como padrão
+    ano_sel = st.selectbox("Ano", [2023, 2024, 2025, 2026], index=1)
     quad_sel = st.selectbox("Quadrimestre", ["Q1 (Jan-Abr)", "Q2 (Mai-Ago)", "Q3 (Set-Dez)"], index=1)
     meses_sel = get_meses_quadrimestre(quad_sel)
     
@@ -438,11 +441,13 @@ if st.button("Processar Dados", type="primary"):
 
     status.success("Concluído!")
 
-    # Exibição dos diagnósticos em caso de dados zerados
-    with st.expander("🛠️ Diagnóstico Detalhado de Download (Clique para ver logs de erro)", expanded=True if t['s_saidas'] == 0 else False):
+    # Exibição dos diagnósticos em caso de atenção
+    with st.expander("🛠️ Diagnóstico Detalhado de Download", expanded=True if t['s_saidas'] == 0 else False):
         for diag in todos_diagnosticos:
             st.write(f"### Mês {diag['month']:02d}")
             st.write(f"- **RD Bruto:** {diag['total_rd_bruto']} linhas | **RD Filtro CNES:** {diag['total_rd_cnes']} linhas")
+            if diag['colunas_rd']:
+                st.write(f"  * Primeiras colunas RD: `{diag['colunas_rd']}`")
             if diag['cnes_encontrados_rd']:
                 st.write(f"  * CNES encontrados na amostra RD: `{diag['cnes_encontrados_rd']}`")
             st.write("  * **Logs de Download (RD):**")
@@ -450,6 +455,8 @@ if st.button("Processar Dados", type="primary"):
                 st.text(f"    {log}")
 
             st.write(f"- **SP Bruto:** {diag['total_sp_bruto']} linhas | **SP Filtro CNES:** {diag['total_sp_cnes']} linhas")
+            if diag['colunas_sp']:
+                st.write(f"  * Primeiras colunas SP: `{diag['colunas_sp']}`")
             st.write("  * **Logs de Download (SP):**")
             for log in diag['logs_sp']:
                 st.text(f"    {log}")
