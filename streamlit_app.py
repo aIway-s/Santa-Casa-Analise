@@ -6,22 +6,25 @@ import calendar
 import io
 import traceback
 
-# Importações resilientes do PySUS (compatíveis com PySUS v1.x e v2.x modern API)
+# Importações do PySUS com rastreamento de disponibilidade
 sih_api = None
+import_error_msg = ""
+
 try:
     from pysus import sih as sih_api
-except ImportError:
+except Exception as e1:
     try:
         from pysus.api import sih as sih_api
-    except ImportError:
+    except Exception as e2:
         sih_api = None
+        import_error_msg = f"Erro ao importar 'pysus.sih': {e1} | 'pysus.api.sih': {e2}"
 
 sih_download = None
 parquets_to_dataframe = None
 try:
     from pysus.online_data.SIH import download as sih_download
     from pysus.online_data import parquets_to_dataframe
-except ImportError:
+except Exception as e3:
     pass
 
 # ===================== CONFIGURAÇÃO =====================
@@ -62,7 +65,7 @@ def encontrar_coluna(df, candidatos):
 def get_days_in_month(year, month):
     return calendar.monthrange(year, month)[1]
 
-# --- PONTUAÇÃO (REGRAS DE NEGÓCIO MANTIDAS) ---
+# --- PONTUAÇÃO ---
 def pontuacao_mortalidade(taxa): return 7 if taxa <= 3 else (4 if taxa < 6 else (2 if taxa <= 8 else 0))
 def pontuacao_ocupacao(taxa): return 7 if taxa >= 80 else (4 if taxa >= 65 else (2 if taxa >= 55 else 0))
 def pontuacao_tmp_medica(dias): return 6 if 0 < dias < 8 else (4 if 8 <= dias < 11 else (2 if 11 <= dias < 14 else 0))
@@ -70,41 +73,56 @@ def pontuacao_tmp_cirurgica(dias): return 6 if 0 < dias < 5 else (4 if 5 <= dias
 def pontuacao_uti(taxa): return 6 if taxa >= 85 else (4 if taxa >= 70 else (2 if taxa >= 60 else 0))
 def pontuacao_infeccao(densidade): return 6 if densidade <= 2.0 else (4 if densidade <= 3.0 else (2 if densidade <= 5.0 else 0))
 
-# ===================== DOWNLOAD MULTI-VERSÃO PYSUS =====================
-def baixar_dados_sih(uf, year, month, group="RD"):
-    """
-    Baixa os microdados do SIH utilizando a API do PySUS com fallback automático 
-    entre a API moderna (PySUS 2.x) e o método clássico (download/parquets_to_dataframe).
-    """
+# ===================== DOWNLOAD DIAGNÓSTICO PYSUS =====================
+def baixar_dados_sih_diagnostico(uf, year, month, group="RD"):
+    logs = []
+    
     # 1. Tentativa via API Moderna (PySUS 2.x+)
     if sih_api is not None:
         grupos_para_testar = [group, group.lower(), group.upper()]
         for grp in grupos_para_testar:
             try:
+                logs.append(f"Tentando PySUS sih(state='{uf}', year={year}, month=[{month}], group='{grp}')...")
                 res = sih_api(state=uf, year=int(year), month=[int(month)], group=grp, as_dataframe=True)
                 if isinstance(res, pd.DataFrame) and not res.empty:
-                    return res
-            except Exception:
-                pass
+                    logs.append(f"✅ Sucesso via PySUS 2.x API (`group='{grp}'`)! {len(res)} linhas baixadas.")
+                    return res, logs
+                else:
+                    logs.append(f"⚠️ PySUS retornou objeto vazio para `group='{grp}'`.")
+            except Exception as e:
+                logs.append(f"❌ Erro na tentativa `group='{grp}'`: {type(e).__name__} - {e}")
+            
             try:
                 res = sih_api(state=uf, year=int(year), month=int(month), group=grp, as_dataframe=True)
                 if isinstance(res, pd.DataFrame) and not res.empty:
-                    return res
-            except Exception:
-                pass
+                    logs.append(f"✅ Sucesso via PySUS 2.x API (mês inteiro)! {len(res)} linhas baixadas.")
+                    return res, logs
+            except Exception as e:
+                logs.append(f"❌ Erro na tentativa mês int `group='{grp}'`: {type(e).__name__} - {e}")
+    else:
+        logs.append(f"⚠️ PySUS modern API indisponível. Motivo: {import_error_msg}")
 
     # 2. Tentativa via API Clássica (PySUS 1.x / online_data)
     if sih_download is not None and parquets_to_dataframe is not None:
         try:
+            logs.append(f"Tentando PySUS clássico `SIH.download(state='{uf}', year={year}, month={month}, group='{group}')`...")
             arquivos = sih_download(state=uf, year=int(year), month=int(month), group=group)
             if arquivos:
+                logs.append(f"Baixados {len(arquivos)} arquivos parquet: {arquivos}")
                 df = parquets_to_dataframe(arquivos)
                 if isinstance(df, pd.DataFrame) and not df.empty:
-                    return df
-        except Exception:
-            pass
+                    logs.append(f"✅ Sucesso via PySUS clássico! {len(df)} linhas lidas.")
+                    return df, logs
+                else:
+                    logs.append("⚠️ parquets_to_dataframe retornou um DataFrame vazio.")
+            else:
+                logs.append("⚠️ SIH.download retornou lista vazia.")
+        except Exception as e:
+            logs.append(f"❌ Erro no PySUS clássico: {type(e).__name__} - {e}")
+    else:
+        logs.append("⚠️ PySUS clássico (`online_data.SIH.download`) não está disponível.")
 
-    return pd.DataFrame()
+    return pd.DataFrame(), logs
 
 # ===================== PROCESSAMENTO COM CACHE =====================
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -117,19 +135,30 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
                         "dias_cir", "saidas_cir", "dias_a", "dias_n", "dias_p"]}
     d["mes"] = month
     cnes_alvo_str = str(cnes_filter).strip().zfill(7)
+    cnes_alvo_int = int(str(cnes_filter).strip()) if str(cnes_filter).strip().isdigit() else 0
     
-    # ------------------- 1. RD (Lógica Mista - Hospitalizações) -------------------
-    df_rd = baixar_dados_sih(uf=uf, year=year, month=month, group="RD")
+    diag_info = {"month": month, "logs_rd": [], "logs_sp": [], "total_rd_bruto": 0, "total_rd_cnes": 0, "cnes_encontrados_rd": [], "total_sp_bruto": 0, "total_sp_cnes": 0}
+
+    # ------------------- 1. RD (Hospitalizações Reduzidas) -------------------
+    df_rd, logs_rd = baixar_dados_sih_diagnostico(uf=uf, year=year, month=month, group="RD")
+    diag_info["logs_rd"] = logs_rd
 
     if df_rd is not None and not df_rd.empty:
+        diag_info["total_rd_bruto"] = len(df_rd)
         df_rd.columns = [str(c).upper().strip() for c in df_rd.columns]
         
         cnes_c = encontrar_coluna(df_rd, ["CNES", "CNES_EXEC", "CODUFMUN"])
         if cnes_c:
-            cnes_col_str = df_rd[cnes_c].astype(str).str.replace(r"\D", "", regex=True).str.zfill(7)
-            df_rd = df_rd[cnes_col_str == cnes_alvo_str].copy()
+            col_cnes_vals = df_rd[cnes_c].astype(str).str.replace(r"\D", "", regex=True)
+            diag_info["cnes_encontrados_rd"] = list(col_cnes_vals.unique()[:10])
             
-            if not df_rd.empty:
+            cnes_col_str = col_cnes_vals.str.zfill(7)
+            # Filtro flexível (string zfill ou inteiro)
+            df_rd_filtered = df_rd[(cnes_col_str == cnes_alvo_str) | (pd.to_numeric(df_rd[cnes_c], errors='coerce') == cnes_alvo_int)].copy()
+            diag_info["total_rd_cnes"] = len(df_rd_filtered)
+            
+            if not df_rd_filtered.empty:
+                df_rd = df_rd_filtered
                 c_morte = encontrar_coluna(df_rd, ["MORTE", "OBITO"])
                 c_dias = encontrar_coluna(df_rd, ["DIAS_PERM", "QT_DIARIAS"])
                 c_espec = encontrar_coluna(df_rd, ["ESPEC", "COD_ESPEC"])
@@ -159,18 +188,23 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
                     df_cir_saidas = df_cir_dias[~df_cir_dias['MOTIVO_INT'].isin(MOTIVOS_NAO_CONTAR_SAIDA)]
                     d["saidas_cir"] = len(df_cir_saidas)
 
-    # ------------------- 2. SP (Serviços Profissionais / UTIs) -------------------
-    df_sp = baixar_dados_sih(uf=uf, year=year, month=month, group="SP")
+    # ------------------- 2. SP (UTIs) -------------------
+    df_sp, logs_sp = baixar_dados_sih_diagnostico(uf=uf, year=year, month=month, group="SP")
+    diag_info["logs_sp"] = logs_sp
 
     if df_sp is not None and not df_sp.empty:
+        diag_info["total_sp_bruto"] = len(df_sp)
         df_sp.columns = [str(c).upper().strip() for c in df_sp.columns]
         
         cnes_s = encontrar_coluna(df_sp, ["CNES", "SP_CNES"])
         if cnes_s:
-            cnes_sp_str = df_sp[cnes_s].astype(str).str.replace(r"\D", "", regex=True).str.zfill(7)
-            df_sp = df_sp[cnes_sp_str == cnes_alvo_str].copy()
+            col_cnes_sp = df_sp[cnes_s].astype(str).str.replace(r"\D", "", regex=True)
+            cnes_sp_str = col_cnes_sp.str.zfill(7)
+            df_sp_filtered = df_sp[(cnes_sp_str == cnes_alvo_str) | (pd.to_numeric(df_sp[cnes_s], errors='coerce') == cnes_alvo_int)].copy()
+            diag_info["total_sp_cnes"] = len(df_sp_filtered)
             
-            if not df_sp.empty:
+            if not df_sp_filtered.empty:
+                df_sp = df_sp_filtered
                 c_ato = next((c for c in df_sp.columns if "ATOPROF" in c), "SP_ATOPROF")
                 c_qtd = next((c for c in df_sp.columns if "QT_" in c), "SP_QTD_ATO")
                 c_val = next((c for c in df_sp.columns if "VAL" in c), "SP_VALATO")
@@ -195,7 +229,7 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
                     d["dias_p"] = int(df_ok.loc[mask_p, c_qtd].sum()) if mask_p.any() else 0
 
     d.update({"cap_geral": caps['geral'], "cap_a": caps['uti_a'], "cap_n": caps['uti_n'], "cap_p": caps['uti_p']})
-    return d
+    return d, diag_info
 
 # ===================== PLOTAGEM E UI =====================
 def plot_indicador(ax, df, col_y, media, title, color_ok):
@@ -273,11 +307,13 @@ with st.sidebar:
 if st.button("Processar Dados", type="primary"):
     bar = st.progress(0); status = st.empty()
     res = []
+    todos_diagnosticos = []
     
     for i, m in enumerate(meses_sel):
-        status.text(f"Baixando/Processando {m:02d}/{ano_sel} via PySUS...")
-        r = processar_mes_unico(ano_sel, m, uf_input, cnes_input)
+        status.text(f"Baixando/Processando Mês {m:02d}/{ano_sel} via PySUS...")
+        r, diag = processar_mes_unico(ano_sel, m, uf_input, cnes_input)
         res.append(r)
+        todos_diagnosticos.append(diag)
         bar.progress((i+1)/len(meses_sel))
     
     status.text("Calculando indicadores..."); bar.progress(100)
@@ -326,7 +362,25 @@ if st.button("Processar Dados", type="primary"):
     t['p_inf'] = pontuacao_infeccao(t['tx_inf'])
     t['total_pts'] = t['p_mort'] + t['p_ocup'] + t['p_med'] + t['p_cir'] + t['p_a'] + t['p_n'] + t['p_p'] + t['p_inf']
 
-    status.success("Concluído com sucesso!")
+    status.success("Concluído!")
+
+    # Exibição dos diagnósticos em caso de dados zerados
+    with st.expander("🛠️ Diagnóstico Detalhado de Download (Clique para ver logs de erro)", expanded=True if t['s_saidas'] == 0 else False):
+        for diag in todos_diagnosticos:
+            st.write(f"### Mês {diag['month']:02d}")
+            st.write(f"- **RD Bruto:** {diag['total_rd_bruto']} linhas | **RD Filtro CNES:** {diag['total_rd_cnes']} linhas")
+            if diag['cnes_encontrados_rd']:
+                st.write(f"  * CNES encontrados na amostra RD: `{diag['cnes_encontrados_rd']}`")
+            st.write("  * **Logs de Download (RD):**")
+            for log in diag['logs_rd']:
+                st.text(f"    {log}")
+
+            st.write(f"- **SP Bruto:** {diag['total_sp_bruto']} linhas | **SP Filtro CNES:** {diag['total_sp_cnes']} linhas")
+            st.write("  * **Logs de Download (SP):**")
+            for log in diag['logs_sp']:
+                st.text(f"    {log}")
+            st.markdown("---")
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Pontuação Total", f"{t['total_pts']} / 50")
     c2.metric("Mortalidade", f"{t['tx_mort']:.2f}%", f"Nota {t['p_mort']}")
