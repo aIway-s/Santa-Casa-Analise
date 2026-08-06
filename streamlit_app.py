@@ -7,25 +7,32 @@ import io
 import os
 import traceback
 
-# Importações do PySUS com rastreamento de disponibilidade
+# Importações do PySUS com tratamento de avisos do Pylance / VS Code
 sih_api = None
 import_error_msg = ""
 
 try:
-    from pysus.api import sih as sih_api
+    from pysus.api import sih as sih_api  # type: ignore
 except Exception as e1:
     try:
-        from pysus import sih as sih_api
+        from pysus import sih as sih_api  # type: ignore
     except Exception as e2:
         sih_api = None
         import_error_msg = f"Erro ao importar 'pysus.api.sih': {e1} | 'pysus': {e2}"
 
 sih_download = None
+sih_class = None
 parquets_to_dataframe = None
+
 try:
-    from pysus.online_data.SIH import download as sih_download
-    from pysus.online_data import parquets_to_dataframe
-except Exception as e3:
+    from pysus.online_data.SIH import download as sih_download  # type: ignore
+    from pysus.online_data import parquets_to_dataframe  # type: ignore
+except Exception:
+    pass
+
+try:
+    from pysus.online_data.SIH import SIH as sih_class  # type: ignore
+except Exception:
     pass
 
 # ===================== CONFIGURAÇÃO =====================
@@ -68,6 +75,19 @@ def encontrar_coluna(df, candidatos):
 def get_days_in_month(year, month):
     return calendar.monthrange(year, month)[1]
 
+# --- VERIFICADORES DE ESTRUTURA DE TABELA (RD vs SP) ---
+def eh_tabela_rd(df):
+    if df is None or df.empty: return False
+    cols = [str(c).upper().strip() for c in df.columns]
+    tem_rd = any(c in cols for c in ['MORTE', 'DIAS_PERM', 'ESPEC', 'N_AIH', 'UF_ZI', 'DIAG_PRINC', 'COBRANCA'])
+    tem_sp = any(c in cols for c in ['SP_ATOPROF', 'SP_PROCDIG', 'SP_QTD_ATO', 'SP_VALATO'])
+    return tem_rd and not tem_sp
+
+def eh_tabela_sp(df):
+    if df is None or df.empty: return False
+    cols = [str(c).upper().strip() for c in df.columns]
+    return any(c in cols for c in ['SP_ATOPROF', 'SP_PROCDIG', 'SP_QTD_ATO', 'SP_VALATO', 'SP_ATO', 'ATOPROF']) or ('SP_GESTOR' in cols and 'SP_CNES' in cols)
+
 # --- PONTUAÇÃO ---
 def pontuacao_mortalidade(taxa): return 7 if taxa <= 3 else (4 if taxa < 6 else (2 if taxa <= 8 else 0))
 def pontuacao_ocupacao(taxa): return 7 if taxa >= 80 else (4 if taxa >= 65 else (2 if taxa >= 55 else 0))
@@ -78,14 +98,6 @@ def pontuacao_infeccao(densidade): return 6 if densidade <= 2.0 else (4 if densi
 
 # ===================== CONVERSOR UNIVERSAL PYSUS =====================
 def converter_pysus_para_dataframe(res):
-    """
-    O PySUS pode retornar:
-    1. Um pandas DataFrame diretamente.
-    2. Uma lista ou tupla de caminhos de arquivos Parquet (ex: ['/cache/RDMG2505.parquet']).
-    3. Um caminho string único para arquivo Parquet/DBC.
-    4. Um objeto Dataset com método .to_dataframe() ou .load().
-    Esta função unifica qualquer desses retornos em um DataFrame.
-    """
     if res is None:
         return None
     if isinstance(res, pd.DataFrame):
@@ -130,64 +142,105 @@ def converter_pysus_para_dataframe(res):
 # ===================== DOWNLOAD DIAGNÓSTICO PYSUS =====================
 def baixar_dados_sih_diagnostico(uf, year, month, group="RD"):
     logs = []
+    target_group = group.upper().strip()
     
-    # 1. Tentativa via API Moderna (PySUS 2.x+)
+    def validar_df(df, metodo_nome):
+        if df is None or df.empty:
+            return None
+        
+        if target_group == "RD":
+            if eh_tabela_rd(df):
+                logs.append(f"✅ Sucesso [{metodo_nome}]! Tabela RD validada com {len(df)} linhas.")
+                return df
+            elif eh_tabela_sp(df):
+                logs.append(f"⚠️ [{metodo_nome}] Baixou tabela SP ao invés de RD. Tentando outro método...")
+                return None
+            else:
+                logs.append(f"ℹ️ [{metodo_nome}] Baixou {len(df)} linhas, mas colunas RD não confirmadas.")
+                return df
+        else: # SP
+            if eh_tabela_sp(df):
+                logs.append(f"✅ Sucesso [{metodo_nome}]! Tabela SP validada com {len(df)} linhas.")
+                return df
+            elif eh_tabela_rd(df):
+                logs.append(f"⚠️ [{metodo_nome}] Baixou tabela RD ao invés de SP. Tentando outro método...")
+                return None
+            else:
+                logs.append(f"ℹ️ [{metodo_nome}] Baixou {len(df)} linhas, mas colunas SP não confirmadas.")
+                return df
+
+    # 1. Tentativa via Classe SIH do PySUS (online_data.SIH)
+    if sih_class is not None:
+        for grp in [target_group, target_group.lower()]:
+            try:
+                logs.append(f"Tentando `SIH().download(group='{grp}', state='{uf}', year={year}, month={month})`...")
+                inst = sih_class()
+                res = inst.download(group=grp, state=uf, year=int(year), month=int(month))
+                df = converter_pysus_para_dataframe(res)
+                v_df = validar_df(df, f"SIH().download group={grp}")
+                if v_df is not None: return v_df, logs
+            except Exception as e:
+                logs.append(f"❌ Erro em `SIH().download group='{grp}'`: {e}")
+
+            try:
+                res = inst.download(uf, int(year), int(month), grp)
+                df = converter_pysus_para_dataframe(res)
+                v_df = validar_df(df, f"SIH().download posicional grp={grp}")
+                if v_df is not None: return v_df, logs
+            except Exception as e:
+                pass
+
+    # 2. Tentativa via função de download clássica (sih_download)
+    if sih_download is not None:
+        for grp in [target_group, target_group.lower()]:
+            try:
+                logs.append(f"Tentando `sih_download(group='{grp}', state='{uf}', year={year}, month={month})`...")
+                res = sih_download(group=grp, state=uf, year=int(year), month=int(month))
+                df = converter_pysus_para_dataframe(res)
+                v_df = validar_df(df, f"sih_download group={grp}")
+                if v_df is not None: return v_df, logs
+            except Exception as e:
+                logs.append(f"❌ Erro em `sih_download group='{grp}'`: {e}")
+            
+            try:
+                res = sih_download(uf, int(year), int(month), grp)
+                df = converter_pysus_para_dataframe(res)
+                v_df = validar_df(df, f"sih_download posicional grp={grp}")
+                if v_df is not None: return v_df, logs
+            except Exception as e:
+                pass
+
+    # 3. Tentativa via API Moderna (sih_api com dis_type e group)
     if sih_api is not None:
-        grupos_para_testar = [group, group.upper(), group.lower()]
-        for grp in grupos_para_testar:
-            # Variação A: sih(state=uf, year=year, month=[month], group=grp)
+        for grp in [target_group, target_group.lower()]:
+            try:
+                logs.append(f"Tentando `sih(state='{uf}', year={year}, month=[{month}], dis_type='{grp}')`...")
+                res = sih_api(state=uf, year=int(year), month=[int(month)], dis_type=grp)
+                df = converter_pysus_para_dataframe(res)
+                v_df = validar_df(df, f"sih dis_type={grp}")
+                if v_df is not None: return v_df, logs
+            except Exception as e:
+                pass
+
             try:
                 logs.append(f"Tentando `sih(state='{uf}', year={year}, month=[{month}], group='{grp}')`...")
                 res = sih_api(state=uf, year=int(year), month=[int(month)], group=grp)
                 df = converter_pysus_para_dataframe(res)
-                if df is not None and not df.empty:
-                    logs.append(f"✅ Sucesso via PySUS API (`group='{grp}'`)! Retorno: {type(res).__name__} -> {len(df)} linhas de dados.")
-                    return df, logs
-                else:
-                    logs.append(f"⚠️ PySUS retornou tipo `{type(res).__name__}` mas sem linhas de dados para `group='{grp}'`.")
-            except Exception as e:
-                logs.append(f"❌ Erro em `group='{grp}'`: {type(e).__name__} - {e}")
-            
-            # Variação B: sih(state=uf, year=year, month=month, group=grp) com mês int
-            try:
-                res = sih_api(state=uf, year=int(year), month=int(month), group=grp)
-                df = converter_pysus_para_dataframe(res)
-                if df is not None and not df.empty:
-                    logs.append(f"✅ Sucesso via PySUS API com mês int (`group='{grp}'`)! {len(df)} linhas.")
-                    return df, logs
+                v_df = validar_df(df, f"sih group={grp}")
+                if v_df is not None: return v_df, logs
             except Exception as e:
                 pass
 
-        # Variação C: sih(state=uf, year=year, month=[month]) sem especificar group
+        # Fallback sem grupo se nada mais funcionou
         try:
-            logs.append(f"Tentando `sih(state='{uf}', year={year}, month=[{month}])` sem grupo...")
+            logs.append(f"Fallback: `sih(state='{uf}', year={year}, month=[{month}])` sem grupo...")
             res = sih_api(state=uf, year=int(year), month=[int(month)])
             df = converter_pysus_para_dataframe(res)
             if df is not None and not df.empty:
-                logs.append(f"✅ Sucesso via PySUS API sem grupo! {len(df)} linhas.")
+                logs.append(f"⚠️ Fallback utilizado (linhas: {len(df)}).")
                 return df, logs
         except Exception as e:
-            logs.append(f"❌ Erro sem grupo: {type(e).__name__} - {e}")
-
-    else:
-        logs.append(f"⚠️ PySUS modern API indisponível. Motivo: {import_error_msg}")
-
-    # 2. Tentativa via API Clássica (PySUS 1.x / online_data)
-    if sih_download is not None:
-        for grp in [group, group.upper(), group.lower()]:
-            try:
-                logs.append(f"Tentando PySUS clássico `SIH.download(group='{grp}', state='{uf}', year={year}, month={month})`...")
-                arquivos = sih_download(group=grp, state=uf, year=int(year), month=int(month))
-                df = converter_pysus_para_dataframe(arquivos)
-                if df is not None and not df.empty:
-                    logs.append(f"✅ Sucesso via PySUS clássico! {len(df)} linhas lidas.")
-                    return df, logs
-                else:
-                    logs.append(f"⚠️ SIH.download retornou `{arquivos}`, mas não gerou linhas.")
-            except Exception as e:
-                logs.append(f"❌ Erro no PySUS clássico `group='{grp}'`: {type(e).__name__} - {e}")
-    else:
-        logs.append("⚠️ PySUS clássico (`online_data.SIH.download`) não está disponível.")
+            logs.append(f"❌ Erro fallback sem grupo: {e}")
 
     return pd.DataFrame(), logs
 
