@@ -38,16 +38,78 @@ try:
 except Exception:
     pass
 
+read_dbc = None
+dbc2dbf = None
+
 try:
     from pysus.utilities.readdbc import read_dbc  # type: ignore
 except Exception:
+    pass
+
+if read_dbc is None:
+    try:
+        from read_dbc import read_dbc  # type: ignore
+    except Exception:
+        pass
+
+if read_dbc is None:
     try:
         from pysus.utilities.dbc import read_dbc  # type: ignore
     except Exception:
+        pass
+
+if read_dbc is None:
+    try:
+        from pysus.online_data.SIH import read_dbc  # type: ignore
+    except Exception:
+        pass
+
+try:
+    from pysus.utilities.readdbc import dbc2dbf  # type: ignore
+except Exception:
+    try:
+        from pysus.utilities.dbc import dbc2dbf  # type: ignore
+    except Exception:
+        pass
+
+def ler_arquivo_dbc(filepath):
+    if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+        return None
+        
+    # 1. Tentar via read_dbc
+    if read_dbc is not None:
         try:
-            from pysus.online_data.SIH import read_dbc  # type: ignore
+            df = read_dbc(filepath)
+            if df is not None and not df.empty:
+                return df
         except Exception:
             pass
+
+    # 2. Tentar via dbc2dbf + dbfread
+    if dbc2dbf is not None:
+        try:
+            temp_dbf = filepath.replace('.DBC', '.dbf').replace('.dbc', '.dbf')
+            dbc2dbf(filepath, temp_dbf)
+            if os.path.exists(temp_dbf):
+                try:
+                    from dbfread import DBF  # type: ignore
+                    table = DBF(temp_dbf, encoding='iso-8859-1')
+                    df = pd.DataFrame(iter(table))
+                    if os.path.exists(temp_dbf):
+                        os.remove(temp_dbf)
+                    return df
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # 3. Tentar ler direto via pandas/pyarrow se por acaso for parquet disfarçado
+    try:
+        return pd.read_parquet(filepath)
+    except Exception:
+        pass
+
+    return None
 
 # ===================== CONFIGURAÇÃO =====================
 st.set_page_config(page_title="Indicadores - Santa Casa", layout="wide")
@@ -129,11 +191,10 @@ def converter_pysus_para_dataframe(res):
     
     if isinstance(res, str):
         if os.path.exists(res):
-            if res.endswith('.dbc') and read_dbc is not None:
-                try:
-                    return read_dbc(res)
-                except Exception:
-                    pass
+            if res.upper().endswith('.DBC'):
+                df = ler_arquivo_dbc(res)
+                if df is not None:
+                    return df
             try:
                 return pd.read_parquet(res)
             except Exception:
@@ -182,13 +243,13 @@ def download_direto_ftp_datasus(uf, year, month, group):
                 with open(local_path, 'wb') as f:
                     ftp.retrbinary(f"RETR {fname}", f.write)
                 if os.path.exists(local_path) and os.path.getsize(local_path) > 100:
-                    if read_dbc is not None:
-                        df = read_dbc(local_path)
+                    df = ler_arquivo_dbc(local_path)
+                    if df is not None and not df.empty:
                         ftp.quit()
-                        return df, f"Baixou e leu {fname} com sucesso ({len(df)} linhas)"
+                        return df, f"Baixou e descompactou {fname} com sucesso ({len(df)} linhas)"
                     else:
                         ftp.quit()
-                        return None, f"Baixou {fname}, mas biblioteca `read_dbc` não está disponível para descompactar"
+                        return None, f"Baixou {fname} do FTP (tamanho ok), mas não conseguiu descompactar com ler_arquivo_dbc"
             except Exception:
                 continue
                 
