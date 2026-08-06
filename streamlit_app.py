@@ -232,7 +232,7 @@ with st.sidebar:
     st.header("Configurações")
     cnes_input = st.text_input("CNES", "2142376")
     uf_input = st.selectbox("Estado", ["MG"], index=0)
-    ano_sel = st.selectbox("Ano", [2023, 2024, 2025], index=2)
+    ano_sel = st.selectbox("Ano", [2023, 2024, 2025, 2026], index=3)
     quad_sel = st.selectbox("Quadrimestre", ["Q1 (Jan-Abr)", "Q2 (Mai-Ago)", "Q3 (Set-Dez)"], index=1)
     meses_sel = get_meses_quadrimestre(quad_sel)
     
