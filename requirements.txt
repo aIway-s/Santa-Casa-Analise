@@ -7,4 +7,4 @@ pysus==2.7.0
 pyarrow
 fastparquet
 dbfread
-read-dbc
+pyreaddbc

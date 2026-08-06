@@ -41,34 +41,33 @@ except Exception:
 read_dbc = None
 dbc2dbf = None
 
+# Tentar importar do pyreaddbc (AlertaDengue)
 try:
-    from pysus.utilities.readdbc import read_dbc  # type: ignore
+    from pyreaddbc import read_dbc  # type: ignore
 except Exception:
     pass
 
-if read_dbc is None:
-    try:
-        from read_dbc import read_dbc  # type: ignore
-    except Exception:
-        pass
-
-if read_dbc is None:
-    try:
-        from pysus.utilities.dbc import read_dbc  # type: ignore
-    except Exception:
-        pass
-
-if read_dbc is None:
-    try:
-        from pysus.online_data.SIH import read_dbc  # type: ignore
-    except Exception:
-        pass
-
 try:
-    from pysus.utilities.readdbc import dbc2dbf  # type: ignore
+    from pyreaddbc import dbc2dbf  # type: ignore
 except Exception:
+    pass
+
+# Tentar submódulos do PySUS caso pyreaddbc não esteja disponível
+modules_to_check = [
+    "pysus.utilities.readdbc",
+    "pysus.utilities.dbc",
+    "pysus.online_data.SIH",
+    "pysus.data.dbc",
+    "pysus.preprocessing.dbc",
+]
+
+for mod_path in modules_to_check:
     try:
-        from pysus.utilities.dbc import dbc2dbf  # type: ignore
+        mod = __import__(mod_path, fromlist=["read_dbc", "dbc2dbf"])
+        if read_dbc is None and hasattr(mod, "read_dbc"):
+            read_dbc = getattr(mod, "read_dbc")
+        if dbc2dbf is None and hasattr(mod, "dbc2dbf"):
+            dbc2dbf = getattr(mod, "dbc2dbf")
     except Exception:
         pass
 
@@ -76,7 +75,7 @@ def ler_arquivo_dbc(filepath):
     if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
         return None
         
-    # 1. Tentar via read_dbc
+    # 1. Tentar via read_dbc (pyreaddbc ou PySUS)
     if read_dbc is not None:
         try:
             df = read_dbc(filepath)
