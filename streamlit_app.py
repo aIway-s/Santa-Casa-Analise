@@ -44,7 +44,10 @@ except Exception:
     try:
         from pysus.utilities.dbc import read_dbc  # type: ignore
     except Exception:
-        pass
+        try:
+            from pysus.online_data.SIH import read_dbc  # type: ignore
+        except Exception:
+            pass
 
 # ===================== CONFIGURAÇÃO =====================
 st.set_page_config(page_title="Indicadores - Santa Casa", layout="wide")
@@ -159,27 +162,40 @@ def converter_pysus_para_dataframe(res):
 def download_direto_ftp_datasus(uf, year, month, group):
     yy = str(year)[-2:]
     mm = f"{int(month):02d}"
-    filename = f"{group.upper()}{uf.upper()}{yy}{mm}.dbc"
+    
+    variacoes_nome = [
+        f"{group.upper()}{uf.upper()}{yy}{mm}.DBC",
+        f"{group.upper()}{uf.upper()}{yy}{mm}.dbc",
+        f"{group.lower()}{uf.lower()}{yy}{mm}.dbc",
+    ]
+    
+    temp_dir = tempfile.gettempdir()
     
     try:
-        ftp = ftplib.FTP('ftp.datasus.gov.br', timeout=15)
+        ftp = ftplib.FTP('ftp.datasus.gov.br', timeout=20)
         ftp.login()
         ftp.cwd('/dissemin/publicos/SIHSUS/200801_/Dados/')
         
-        temp_dir = tempfile.gettempdir()
-        local_path = os.path.join(temp_dir, filename)
-        
-        with open(local_path, 'wb') as f:
-            ftp.retrbinary(f"RETR {filename}", f.write)
+        for fname in variacoes_nome:
+            local_path = os.path.join(temp_dir, fname)
+            try:
+                with open(local_path, 'wb') as f:
+                    ftp.retrbinary(f"RETR {fname}", f.write)
+                if os.path.exists(local_path) and os.path.getsize(local_path) > 100:
+                    if read_dbc is not None:
+                        df = read_dbc(local_path)
+                        ftp.quit()
+                        return df, f"Baixou e leu {fname} com sucesso ({len(df)} linhas)"
+                    else:
+                        ftp.quit()
+                        return None, f"Baixou {fname}, mas biblioteca `read_dbc` não está disponível para descompactar"
+            except Exception:
+                continue
+                
         ftp.quit()
-        
-        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
-            if read_dbc is not None:
-                df = read_dbc(local_path)
-                return df
+        return None, f"Nenhuma variação de nome ({', '.join(variacoes_nome)}) encontrada no FTP"
     except Exception as e:
-        pass
-    return None
+        return None, f"Erro na conexão FTP: {e}"
 
 # ===================== DOWNLOAD DIAGNÓSTICO PYSUS =====================
 def baixar_dados_sih_diagnostico(uf, year, month, group="RD"):
@@ -211,41 +227,42 @@ def baixar_dados_sih_diagnostico(uf, year, month, group="RD"):
                 logs.append(f"ℹ️ [{metodo_nome}] Baixou {len(df)} linhas, mas colunas SP não confirmadas.")
                 return df
 
-    # Lista de tentativas com argumentos plurais e singulares
+    # Lista de tentativas
     tentativas = []
 
-    # 1. API sih (pysus.api.sih / pysus.sih)
+    # 1. API sih com argumentos POSICIONAIS e NOMINAIS
     if sih_api is not None:
         tentativas.extend([
-            (sih_api, {"states": [uf], "years": [int(year)], "months": [int(month)], "group": target_group}, f"sih(states=['{uf}'], years=[{year}], months=[{month}], group='{target_group}')"),
-            (sih_api, {"states": [uf], "years": [int(year)], "months": [int(month)], "groups": [target_group]}, f"sih(states=['{uf}'], years=[{year}], months=[{month}], groups=['{target_group}'])"),
-            (sih_api, {"states": [uf], "years": [int(year)], "months": [int(month)], "group": target_group.lower()}, f"sih(states=['{uf}'], years=[{year}], months=[{month}], group='{target_group.lower()}')"),
-            (sih_api, {"state": uf, "year": int(year), "month": [int(month)], "group": target_group}, f"sih(state='{uf}', year={year}, month=[{month}], group='{target_group}')"),
-            (sih_api, {"state": uf, "year": int(year), "month": [int(month)], "group": target_group.lower()}, f"sih(state='{uf}', year={year}, month=[{month}], group='{target_group.lower()}')"),
-            (sih_api, {"state": uf, "year": int(year), "month": [int(month)], "dis_type": target_group}, f"sih(state='{uf}', year={year}, month=[{month}], dis_type='{target_group}')"),
+            # Argumentos posicionais (soluciona o erro missing positional arguments)
+            (sih_api, (uf, int(year), int(month), target_group), {}, f"sih('{uf}', {year}, {month}, '{target_group}')"),
+            (sih_api, (uf, int(year), [int(month)], target_group), {}, f"sih('{uf}', {year}, [{month}], '{target_group}')"),
+            (sih_api, (uf, [int(year)], [int(month)], target_group), {}, f"sih('{uf}', [{year}], [{month}], '{target_group}')"),
+            (sih_api, (uf, int(year), int(month)), {"group": target_group}, f"sih('{uf}', {year}, {month}, group='{target_group}')"),
+            (sih_api, (uf, int(year), int(month)), {"dis_type": target_group}, f"sih('{uf}', {year}, {month}, dis_type='{target_group}')"),
+            # Argumentos nominais
+            (sih_api, (), {"state": uf, "year": int(year), "month": int(month), "group": target_group}, f"sih(state='{uf}', year={year}, month={month}, group='{target_group}')"),
+            (sih_api, (), {"state": uf, "year": int(year), "month": [int(month)], "group": target_group}, f"sih(state='{uf}', year={year}, month=[{month}], group='{target_group}')"),
         ])
 
     # 2. Classe SIH (pysus.online_data.SIH)
     if sih_class is not None:
         inst = sih_class()
         tentativas.extend([
-            (inst.download, {"states": uf, "years": int(year), "months": int(month), "groups": target_group}, f"SIH().download(states='{uf}', years={year}, months={month}, groups='{target_group}')"),
-            (inst.download, {"state": uf, "year": int(year), "month": int(month), "group": target_group}, f"SIH().download(state='{uf}', year={year}, month={month}, group='{target_group}')"),
-            (inst.download, {"state": uf, "year": int(year), "month": int(month), "group": target_group.lower()}, f"SIH().download(state='{uf}', year={year}, month={month}, group='{target_group.lower()}')"),
+            (inst.download, (uf, int(year), int(month)), {"group": target_group}, f"SIH().download('{uf}', {year}, {month}, group='{target_group}')"),
+            (inst.download, (), {"state": uf, "year": int(year), "month": int(month), "group": target_group}, f"SIH().download(state='{uf}', year={year}, month={month}, group='{target_group}')"),
         ])
 
     # 3. Download Clássico (sih_download)
     if sih_download is not None:
         tentativas.extend([
-            (sih_download, {"states": uf, "years": int(year), "months": int(month), "groups": target_group}, f"sih_download(states='{uf}', years={year}, months={month}, groups='{target_group}')"),
-            (sih_download, {"state": uf, "year": int(year), "month": int(month), "group": target_group}, f"sih_download(state='{uf}', year={year}, month={month}, group='{target_group}')"),
+            (sih_download, (uf, int(year), int(month)), {"group": target_group}, f"sih_download('{uf}', {year}, {month}, group='{target_group}')"),
         ])
 
     # Executar tentativas registradas
-    for fn, kwargs, rotulo in tentativas:
+    for fn, args, kwargs, rotulo in tentativas:
         try:
             logs.append(f"Tentando `{rotulo}`...")
-            res = fn(**kwargs)
+            res = fn(*args, **kwargs)
             df = converter_pysus_para_dataframe(res)
             v_df = validar_df(df, rotulo)
             if v_df is not None:
@@ -255,14 +272,13 @@ def baixar_dados_sih_diagnostico(uf, year, month, group="RD"):
 
     # 4. FALLBACK FINAL DIRETO VIA FTP DO DATASUS (ftp.datasus.gov.br)
     try:
-        logs.append(f"Tentando Download Direto FTP DATASUS (`{target_group}{uf}{str(year)[-2:]}{int(month):02d}.dbc`)...")
-        df_ftp = download_direto_ftp_datasus(uf, year, month, target_group)
+        logs.append(f"Tentando Download Direto FTP DATASUS (`{target_group}{uf}{str(year)[-2:]}{int(month):02d}.DBC`)...")
+        df_ftp, msg_ftp = download_direto_ftp_datasus(uf, year, month, target_group)
+        logs.append(f"ℹ️ [{target_group}] FTP DATASUS: {msg_ftp}")
         if df_ftp is not None and not df_ftp.empty:
             v_df = validar_df(df_ftp, "FTP Direto DATASUS")
             if v_df is not None:
                 return v_df, logs
-        else:
-            logs.append("⚠️ Conexão FTP direta não retornou dados válidos.")
     except Exception as e:
         logs.append(f"❌ Erro no FTP direto: {e}")
 
@@ -483,14 +499,14 @@ if st.button("Processar Dados", type="primary"):
     man = pd.DataFrame(manual)
     df = pd.merge(df, man, on="mes", how="left")
     
-    # Cálculo mensal individual
+    # Cálculo mensal individual (limitado a 100% max no display de UTI)
     df["tx_mort_m"] = (df["obitos_tot"]/df["saidas_tot"]*100).where(df["tem_rd"], 0)
     df["tx_ocup_m"] = (df["dias_geral"]/df["cap_geral"]*100).where(df["tem_rd"], 0).clip(upper=100)
     df["tmp_med_m"] = (df["dias_med"]/df["saidas_med"]).where(df["tem_rd"], 0)
     df["tmp_cir_m"] = (df["dias_cir"]/df["saidas_cir"]).where(df["tem_rd"], 0)
-    df["tx_a_m"] = (df["dias_a"]/df["cap_a"]*100).where(df["tem_sp"], 0)
-    df["tx_n_m"] = (df["dias_n"]/df["cap_n"]*100).where(df["tem_sp"], 0)
-    df["tx_p_m"] = (df["dias_p"]/df["cap_p"]*100).where(df["tem_sp"], 0)
+    df["tx_a_m"] = (df["dias_a"]/df["cap_a"]*100).where(df["tem_sp"], 0).clip(upper=100)
+    df["tx_n_m"] = (df["dias_n"]/df["cap_n"]*100).where(df["tem_sp"], 0).clip(upper=100)
+    df["tx_p_m"] = (df["dias_p"]/df["cap_p"]*100).where(df["tem_sp"], 0).clip(upper=100)
     df["dens_inf_m"] = (df["casos"]/df["cvc"]*1000).fillna(0)
 
     # Filtrar apenas meses que possuem dados publicados para compor a média consolidada
@@ -521,12 +537,12 @@ if st.button("Processar Dados", type="primary"):
 
     # Taxas Consolidadas
     t['tx_mort'] = (t['s_obitos']/t['s_saidas']*100) if t['s_saidas'] else 0
-    t['tx_ocup'] = (t['s_dias_g']/t['s_cap_g']*100) if t['s_cap_g'] else 0
+    t['tx_ocup'] = min((t['s_dias_g']/t['s_cap_g']*100), 100.0) if t['s_cap_g'] else 0
     t['tx_med'] = (t['s_dias_m']/t['s_sai_m']) if t['s_sai_m'] else 0
     t['tx_cir'] = (t['s_dias_c']/t['s_sai_c']) if t['s_sai_c'] else 0
-    t['tx_a'] = (t['s_dias_a']/t['s_cap_a']*100) if t['s_cap_a'] else 0
-    t['tx_n'] = (t['s_dias_n']/t['s_cap_n']*100) if t['s_cap_n'] else 0
-    t['tx_p'] = (t['s_dias_p']/t['s_cap_p']*100) if t['s_cap_p'] else 0
+    t['tx_a'] = min((t['s_dias_a']/t['s_cap_a']*100), 100.0) if t['s_cap_a'] else 0
+    t['tx_n'] = min((t['s_dias_n']/t['s_cap_n']*100), 100.0) if t['s_cap_n'] else 0
+    t['tx_p'] = min((t['s_dias_p']/t['s_cap_p']*100), 100.0) if t['s_cap_p'] else 0
     t['tx_inf'] = (t['s_casos']/t['s_cvc']*1000) if t['s_cvc'] else 0
 
     t['p_mort'] = pontuacao_mortalidade(t['tx_mort'])
