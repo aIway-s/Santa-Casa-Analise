@@ -4,9 +4,9 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import calendar
 import io
-import numpy as np
+import traceback # Para capturar o log completo do erro
 
-# Import do PySUS 2.7.0 (Nova API)
+# Import do PySUS 2.7.0+
 from pysus import sih
 
 # ===================== CONFIGURAÇÃO =====================
@@ -23,13 +23,7 @@ MAPA_UTI_ESTRITO = {
     '0802010156': 'P'
 }
 
-# 1. ESPEC
-CODIGOS_ESPEC = {
-    'MEDICA': ['03'],    
-    'CIRURGICA': ['01']  
-}
-
-# 2. MOTIVOS QUE ENTRAM NOS DIAS, MAS NÃO NA CONTAGEM DE SAÍDA
+CODIGOS_ESPEC = {'MEDICA': ['03'], 'CIRURGICA': ['01']}
 MOTIVOS_NAO_CONTAR_SAIDA = [26, 21, 22]
 
 # ===================== AUXILIARES =====================
@@ -60,8 +54,8 @@ def pontuacao_tmp_cirurgica(dias): return 6 if 0 < dias < 5 else (4 if 5 <= dias
 def pontuacao_uti(taxa): return 6 if taxa >= 85 else (4 if taxa >= 70 else (2 if taxa >= 60 else 0))
 def pontuacao_infeccao(densidade): return 6 if densidade <= 2.0 else (4 if densidade <= 3.0 else (2 if densidade <= 5.0 else 0))
 
-# ===================== PROCESSAMENTO =====================
-@st.cache_data(show_spinner=False)
+# ===================== PROCESSAMENTO (SEM CACHE PARA DEBUG) =====================
+# Removido o @st.cache_data temporariamente para garantir que os prints apareçam na tela
 def processar_mes_unico(ano, month, uf, cnes_filter):
     year = ano
     dias_mes = get_days_in_month(year, month)
@@ -69,14 +63,23 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
     
     d = {k: 0 for k in ["saidas_tot", "obitos_tot", "dias_geral", "dias_med", "saidas_med",
                         "dias_cir", "saidas_cir", "dias_a", "dias_n", "dias_p"]}
-    d['logs'] = []
     d["mes"] = month
     
     # ------------------- 1. RD (Lógica Mista) -------------------
     try:
-        # Nova chamada direta da API do PySUS 2.7.0+
         df_rd = sih(state=uf, year=year, month=month, group="RD", as_dataframe=True)
         
+        # DEBUG NA TELA: O que o PySUS retornou de verdade?
+        with st.expander(f"🕵️ Log de Extração: RD - {month}/{year}", expanded=True):
+            if df_rd is None:
+                st.error("PySUS retornou NONE. Arquivo pode não existir no FTP.")
+            elif df_rd.empty:
+                st.warning("PySUS retornou um DataFrame VAZIO (0 linhas).")
+            else:
+                st.success(f"Sucesso! Baixadas {len(df_rd)} linhas.")
+                st.write("Amostra dos Dados Brutos:")
+                st.dataframe(df_rd.head(3))
+                
         if df_rd is not None and not df_rd.empty:
             df_rd.columns = [c.upper().strip() for c in df_rd.columns]
             
@@ -87,7 +90,6 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
                 
                 if not df_rd.empty:
                     c_morte = encontrar_coluna(df_rd, ["MORTE", "OBITO"])
-                    # DIAS_PERM (Bruto, para bater os 5076)
                     c_dias = encontrar_coluna(df_rd, ["DIAS_PERM", "QT_DIARIAS"])
                     c_espec = encontrar_coluna(df_rd, ["ESPEC", "COD_ESPEC"])
                     c_motivo = encontrar_coluna(df_rd, ["COBRANCA", "MOT_SAIDA", "COBRA_SAI"])
@@ -95,7 +97,6 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
                     if c_morte: df_rd[c_morte] = pd.to_numeric(df_rd[c_morte], errors='coerce').fillna(0).astype(int)
                     if c_dias: df_rd[c_dias] = pd.to_numeric(df_rd[c_dias], errors='coerce').fillna(0).astype(int)
 
-                    # Filtro Básico (NÃO removemos motivo 26 aqui ainda!)
                     df_rd = df_rd[df_rd[c_dias] >= 0].copy()
 
                     if c_morte and c_dias:
@@ -103,36 +104,42 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
                         d["obitos_tot"] = df_rd[df_rd[c_morte] == 1].shape[0]
                         d["dias_geral"] = df_rd[c_dias].sum()
 
-                    # === LÓGICA MISTA AQUI ===
                     if c_espec and c_motivo:
                         df_rd['ESPEC_STR'] = df_rd[c_espec].astype(str).str.split('.').str[0].str.strip().str.zfill(2)
                         df_rd['MOTIVO_INT'] = pd.to_numeric(df_rd[c_motivo], errors='coerce').fillna(0).astype(int)
                         
-                        # --- MÉDICA (03) ---
-                        # 1. Numerador: Pega TODOS (incluindo Motivo 26) -> Para bater 5076
                         df_med_dias = df_rd[df_rd['ESPEC_STR'].isin(CODIGOS_ESPEC['MEDICA'])]
                         d["dias_med"] = df_med_dias[c_dias].sum()
-                        
-                        # 2. Denominador: Filtra Motivos RUINS -> Para bater 601
                         df_med_saidas = df_med_dias[~df_med_dias['MOTIVO_INT'].isin(MOTIVOS_NAO_CONTAR_SAIDA)]
                         d["saidas_med"] = len(df_med_saidas)
                         
-                        # --- CIRÚRGICA (01) ---
-                        # 1. Numerador: Todos -> Para bater 2407
                         df_cir_dias = df_rd[df_rd['ESPEC_STR'].isin(CODIGOS_ESPEC['CIRURGICA'])]
                         d["dias_cir"] = df_cir_dias[c_dias].sum()
-                        
-                        # 2. Denominador: Filtra -> Para bater 573
                         df_cir_saidas = df_cir_dias[~df_cir_dias['MOTIVO_INT'].isin(MOTIVOS_NAO_CONTAR_SAIDA)]
                         d["saidas_cir"] = len(df_cir_saidas)
+                else:
+                    st.warning(f"O CNES {cnes_filter} não foi encontrado dentro da base RD baixada em {month}/{year}.")
 
-    except Exception as e: 
-        st.error(f"Erro no processamento de RD ({month}/{year}): {e}")
+    except Exception as e:
+        # Se quebrar, joga o log de erro inteiro na tela (traceback)
+        st.error(f"❌ Erro Crítico no processamento de RD ({month}/{year}): {e}")
+        st.code(traceback.format_exc())
 
     # ------------------- 2. SP (UTIs) -------------------
     try:
         df_sp = sih(state=uf, year=year, month=month, group="SP", as_dataframe=True)
         
+        # DEBUG NA TELA: O que o PySUS retornou de verdade?
+        with st.expander(f"🕵️ Log de Extração: SP - {month}/{year}", expanded=True):
+            if df_sp is None:
+                st.error("PySUS retornou NONE. Arquivo pode não existir no FTP.")
+            elif df_sp.empty:
+                st.warning("PySUS retornou um DataFrame VAZIO (0 linhas).")
+            else:
+                st.success(f"Sucesso! Baixadas {len(df_sp)} linhas.")
+                st.write("Amostra dos Dados Brutos:")
+                st.dataframe(df_sp.head(3))
+                
         if df_sp is not None and not df_sp.empty:
             df_sp.columns = [c.upper().strip() for c in df_sp.columns]
             
@@ -165,9 +172,13 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
                         d["dias_a"] = df_ok[mask_a].groupby([c_aih, c_ato])[c_qtd].sum().sum()
                         d["dias_n"] = df_ok[mask_n].groupby([c_aih, c_ato])[c_qtd].sum().sum()
                         d["dias_p"] = df_ok[mask_p].groupby([c_aih, c_ato])[c_qtd].sum().sum()
+                else:
+                    st.warning(f"O CNES {cnes_filter} não foi encontrado dentro da base SP baixada em {month}/{year}.")
 
-    except Exception as e: 
-        st.error(f"Erro no processamento de SP ({month}/{year}): {e}")
+    except Exception as e:
+        # Se quebrar, joga o log de erro inteiro na tela
+        st.error(f"❌ Erro Crítico no processamento de SP ({month}/{year}): {e}")
+        st.code(traceback.format_exc())
 
     d.update({"cap_geral": caps['geral'], "cap_a": caps['uti_a'], "cap_n": caps['uti_n'], "cap_p": caps['uti_p']})
     return d
@@ -187,7 +198,6 @@ def gerar_pdf_buffer(df, cnes, t):
     buffer = io.BytesIO()
     with PdfPages(buffer) as pdf:
         FIG_SIZE = (18, 12)
-        # P1
         fig1, axs1 = plt.subplots(2, 2, figsize=FIG_SIZE)
         plt.suptitle(f"Indicadores Gerais - CNES {cnes}", fontsize=16, fontweight='bold')
         plot_indicador(axs1[0,0], df, "tx_mort_m", t['tx_mort'], "Mortalidade", "#2a9d8f")
@@ -196,7 +206,6 @@ def gerar_pdf_buffer(df, cnes, t):
         plot_indicador(axs1[1,1], df, "tmp_cir_m", t['tx_cir'], "TMP Cirurgica", "#2a9d8f")
         pdf.savefig(fig1); plt.close()
         
-        # P2
         fig2, axs2 = plt.subplots(2, 2, figsize=FIG_SIZE)
         plt.suptitle(f"Indicadores UTI - CNES {cnes}", fontsize=16, fontweight='bold')
         plot_indicador(axs2[0,0], df, "tx_a_m", t['tx_a'], "UTI Adulto", "#2a9d8f")
@@ -205,7 +214,6 @@ def gerar_pdf_buffer(df, cnes, t):
         plot_indicador(axs2[1,1], df, "dens_inf_m", t['tx_inf'], "Infeccao CVC", "#2a9d8f")
         pdf.savefig(fig2); plt.close()
         
-        # P3
         fig3 = plt.figure(figsize=FIG_SIZE)
         plt.axis('off')
         plt.title("RESUMO EXECUTIVO", fontsize=20, fontweight='bold')
