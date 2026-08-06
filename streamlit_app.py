@@ -182,14 +182,6 @@ def baixar_dados_sih_diagnostico(uf, year, month, group="RD"):
             except Exception as e:
                 logs.append(f"❌ Erro em `SIH().download group='{grp}'`: {e}")
 
-            try:
-                res = inst.download(uf, int(year), int(month), grp)
-                df = converter_pysus_para_dataframe(res)
-                v_df = validar_df(df, f"SIH().download posicional grp={grp}")
-                if v_df is not None: return v_df, logs
-            except Exception as e:
-                pass
-
     # 2. Tentativa via função de download clássica (sih_download)
     if sih_download is not None:
         for grp in [target_group, target_group.lower()]:
@@ -201,14 +193,6 @@ def baixar_dados_sih_diagnostico(uf, year, month, group="RD"):
                 if v_df is not None: return v_df, logs
             except Exception as e:
                 logs.append(f"❌ Erro em `sih_download group='{grp}'`: {e}")
-            
-            try:
-                res = sih_download(uf, int(year), int(month), grp)
-                df = converter_pysus_para_dataframe(res)
-                v_df = validar_df(df, f"sih_download posicional grp={grp}")
-                if v_df is not None: return v_df, logs
-            except Exception as e:
-                pass
 
     # 3. Tentativa via API Moderna (sih_api com dis_type e group)
     if sih_api is not None:
@@ -231,14 +215,13 @@ def baixar_dados_sih_diagnostico(uf, year, month, group="RD"):
             except Exception as e:
                 pass
 
-        # Fallback sem grupo se nada mais funcionou
+        # Fallback sem grupo apenas se compatível com o grupo alvo
         try:
             logs.append(f"Fallback: `sih(state='{uf}', year={year}, month=[{month}])` sem grupo...")
             res = sih_api(state=uf, year=int(year), month=[int(month)])
             df = converter_pysus_para_dataframe(res)
-            if df is not None and not df.empty:
-                logs.append(f"⚠️ Fallback utilizado (linhas: {len(df)}).")
-                return df, logs
+            v_df = validar_df(df, "fallback sem grupo")
+            if v_df is not None: return v_df, logs
         except Exception as e:
             logs.append(f"❌ Erro fallback sem grupo: {e}")
 
@@ -254,6 +237,9 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
     d = {k: 0 for k in ["saidas_tot", "obitos_tot", "dias_geral", "dias_med", "saidas_med",
                         "dias_cir", "saidas_cir", "dias_a", "dias_n", "dias_p"]}
     d["mes"] = month
+    d["tem_rd"] = False
+    d["tem_sp"] = False
+    
     cnes_alvo_str = str(cnes_filter).strip().zfill(7)
     cnes_alvo_int = int(str(cnes_filter).strip()) if str(cnes_filter).strip().isdigit() else 0
     
@@ -278,6 +264,7 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
             diag_info["total_rd_cnes"] = len(df_rd_filtered)
             
             if not df_rd_filtered.empty:
+                d["tem_rd"] = True
                 df_rd = df_rd_filtered
                 c_morte = encontrar_coluna(df_rd, ["MORTE", "OBITO", "DIAG_OBITO"])
                 c_dias = encontrar_coluna(df_rd, ["DIAS_PERM", "QT_DIARIAS", "DIAS"])
@@ -328,6 +315,7 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
             diag_info["total_sp_cnes"] = len(df_sp_filtered)
             
             if not df_sp_filtered.empty:
+                d["tem_sp"] = True
                 df_sp = df_sp_filtered
                 
                 c_ato = encontrar_coluna(df_sp, ["SP_ATOPROF", "SP_PROCDIG", "SP_COD_ATO", "SP_ATO", "ATOPROF", "PROCDIG", "COD_ATO", "PROCEDIMENTO"])
@@ -355,8 +343,6 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
                         d["dias_a"] = int(df_ok.loc[mask_a, c_qtd].sum()) if mask_a.any() else 0
                         d["dias_n"] = int(df_ok.loc[mask_n, c_qtd].sum()) if mask_n.any() else 0
                         d["dias_p"] = int(df_ok.loc[mask_p, c_qtd].sum()) if mask_p.any() else 0
-                else:
-                    diag_info["logs_sp"].append(f"⚠️ Colunas de atos/quantidades de SP não localizadas com precisão. Colunas do DF: {list(df_sp.columns)}")
 
     d.update({"cap_geral": caps['geral'], "cap_a": caps['uti_a'], "cap_n": caps['uti_n'], "cap_p": caps['uti_p']})
     return d, diag_info
@@ -369,8 +355,10 @@ def plot_indicador(ax, df, col_y, media, title, color_ok):
     ax.set_title(f"{title}\nMédia: {media:.2f}", fontweight='bold', fontsize=10)
     ax.grid(axis='y', linestyle='--', alpha=0.3)
     ax.axhline(media, color='blue', linestyle='--')
-    for i, val in enumerate(y):
-        ax.text(i, val, f"{val:.2f}", ha='center', fontsize=8)
+    for i, row in df.iterrows():
+        val = row[col_y]
+        lbl = f"{val:.2f}" if (pd.notnull(val) and val > 0) else "S/ Dados"
+        ax.text(i, max(val, 0.5), lbl, ha='center', fontsize=8)
 
 def gerar_pdf_buffer(df, cnes, t):
     buffer = io.BytesIO()
@@ -417,7 +405,7 @@ with st.sidebar:
     st.header("Configurações")
     cnes_input = st.text_input("CNES", "2142376")
     uf_input = st.selectbox("Estado", ["MG"], index=0)
-    ano_sel = st.selectbox("Ano", [2023, 2024, 2025, 2026], index=1)
+    ano_sel = st.selectbox("Ano", [2023, 2024, 2025, 2026], index=1) # 2024 padrão com dados completos
     quad_sel = st.selectbox("Quadrimestre", ["Q1 (Jan-Abr)", "Q2 (Mai-Ago)", "Q3 (Set-Dez)"], index=1)
     meses_sel = get_meses_quadrimestre(quad_sel)
     
@@ -454,25 +442,43 @@ if st.button("Processar Dados", type="primary"):
     man = pd.DataFrame(manual)
     df = pd.merge(df, man, on="mes", how="left")
     
-    df["tx_mort_m"] = (df["obitos_tot"]/df["saidas_tot"]*100).fillna(0)
-    df["tx_ocup_m"] = (df["dias_geral"]/df["cap_geral"]*100).clip(upper=100).fillna(0)
-    df["tmp_med_m"] = (df["dias_med"]/df["saidas_med"]).fillna(0)
-    df["tmp_cir_m"] = (df["dias_cir"]/df["saidas_cir"]).fillna(0)
-    df["tx_a_m"] = (df["dias_a"]/df["cap_a"]*100).fillna(0)
-    df["tx_n_m"] = (df["dias_n"]/df["cap_n"]*100).fillna(0)
-    df["tx_p_m"] = (df["dias_p"]/df["cap_p"]*100).fillna(0)
+    # Cálculo mensal individual
+    df["tx_mort_m"] = (df["obitos_tot"]/df["saidas_tot"]*100).where(df["tem_rd"], 0)
+    df["tx_ocup_m"] = (df["dias_geral"]/df["cap_geral"]*100).where(df["tem_rd"], 0).clip(upper=100)
+    df["tmp_med_m"] = (df["dias_med"]/df["saidas_med"]).where(df["tem_rd"], 0)
+    df["tmp_cir_m"] = (df["dias_cir"]/df["saidas_cir"]).where(df["tem_rd"], 0)
+    df["tx_a_m"] = (df["dias_a"]/df["cap_a"]*100).where(df["tem_sp"], 0)
+    df["tx_n_m"] = (df["dias_n"]/df["cap_n"]*100).where(df["tem_sp"], 0)
+    df["tx_p_m"] = (df["dias_p"]/df["cap_p"]*100).where(df["tem_sp"], 0)
     df["dens_inf_m"] = (df["casos"]/df["cvc"]*1000).fillna(0)
 
+    # Filtrar apenas meses que possuem dados publicados para compor a média consolidada
+    df_rd_val = df[df["tem_rd"]]
+    df_sp_val = df[df["tem_sp"]]
+
     t = {}
-    t['s_obitos'] = df['obitos_tot'].sum(); t['s_saidas'] = df['saidas_tot'].sum()
-    t['s_dias_g'] = df['dias_geral'].sum(); t['s_cap_g'] = df['cap_geral'].sum()
-    t['s_dias_m'] = df['dias_med'].sum(); t['s_sai_m'] = df['saidas_med'].sum()
-    t['s_dias_c'] = df['dias_cir'].sum(); t['s_sai_c'] = df['saidas_cir'].sum()
-    t['s_dias_a'] = df['dias_a'].sum(); t['s_cap_a'] = df['cap_a'].sum()
-    t['s_dias_n'] = df['dias_n'].sum(); t['s_cap_n'] = df['cap_n'].sum()
-    t['s_dias_p'] = df['dias_p'].sum(); t['s_cap_p'] = df['cap_p'].sum()
+    # Totais RD (Apenas meses com RD disponível)
+    t['s_obitos'] = df_rd_val['obitos_tot'].sum() if not df_rd_val.empty else 0
+    t['s_saidas'] = df_rd_val['saidas_tot'].sum() if not df_rd_val.empty else 0
+    t['s_dias_g'] = df_rd_val['dias_geral'].sum() if not df_rd_val.empty else 0
+    t['s_cap_g'] = df_rd_val['cap_geral'].sum() if not df_rd_val.empty else 0
+    t['s_dias_m'] = df_rd_val['dias_med'].sum() if not df_rd_val.empty else 0
+    t['s_sai_m'] = df_rd_val['saidas_med'].sum() if not df_rd_val.empty else 0
+    t['s_dias_c'] = df_rd_val['dias_cir'].sum() if not df_rd_val.empty else 0
+    t['s_sai_c'] = df_rd_val['saidas_cir'].sum() if not df_rd_val.empty else 0
+    
+    # Totais SP (Apenas meses com SP disponível)
+    t['s_dias_a'] = df_sp_val['dias_a'].sum() if not df_sp_val.empty else 0
+    t['s_cap_a'] = df_sp_val['cap_a'].sum() if not df_sp_val.empty else 0
+    t['s_dias_n'] = df_sp_val['dias_n'].sum() if not df_sp_val.empty else 0
+    t['s_cap_n'] = df_sp_val['cap_n'].sum() if not df_sp_val.empty else 0
+    t['s_dias_p'] = df_sp_val['dias_p'].sum() if not df_sp_val.empty else 0
+    t['s_cap_p'] = df_sp_val['cap_p'].sum() if not df_sp_val.empty else 0
+    
+    # CCIH Manual
     t['s_casos'] = df['casos'].sum(); t['s_cvc'] = df['cvc'].sum()
 
+    # Taxas Consolidadas
     t['tx_mort'] = (t['s_obitos']/t['s_saidas']*100) if t['s_saidas'] else 0
     t['tx_ocup'] = (t['s_dias_g']/t['s_cap_g']*100) if t['s_cap_g'] else 0
     t['tx_med'] = (t['s_dias_m']/t['s_sai_m']) if t['s_sai_m'] else 0
@@ -494,8 +500,22 @@ if st.button("Processar Dados", type="primary"):
 
     status.success("Concluído!")
 
-    # Exibição dos diagnósticos em caso de atenção
-    with st.expander("🛠️ Diagnóstico Detalhado de Download", expanded=True if t['s_saidas'] == 0 else False):
+    # Alertas Informativos sobre Publicação dos Dados no DATASUS
+    meses_sem_rd = df[~df["tem_rd"]]["mes"].tolist()
+    meses_sem_sp = df[~df["tem_sp"]]["mes"].tolist()
+    
+    if meses_sem_rd or meses_sem_sp:
+        msg_alerta = "ℹ️ **Aviso da Base Pública do DATASUS:**"
+        if meses_sem_rd:
+            str_rd = ", ".join([f"{m:02d}" for m in meses_sem_rd])
+            msg_alerta += f"\n- Os arquivos de Internação Reduzida (RD) para o(s) mês(es) **{str_rd}/{ano_sel}** ainda não foram publicados no servidor do DATASUS. As médias de Ocupação/Mortalidade consideraram apenas os meses com dados publicados."
+        if meses_sem_sp:
+            str_sp = ", ".join([f"{m:02d}" for m in meses_sem_sp])
+            msg_alerta += f"\n- Os arquivos de Serviços Profissionais (SP) para o(s) mês(es) **{str_sp}/{ano_sel}** ainda não foram publicados no servidor do DATASUS."
+        st.info(msg_alerta)
+
+    # Exibição dos diagnósticos
+    with st.expander("🛠️ Diagnóstico Detalhado de Download", expanded=False):
         for diag in todos_diagnosticos:
             st.write(f"### Mês {diag['month']:02d}")
             st.write(f"- **RD Bruto:** {diag['total_rd_bruto']} linhas | **RD Filtro CNES:** {diag['total_rd_cnes']} linhas")
