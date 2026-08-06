@@ -193,12 +193,39 @@ def pontuacao_tmp_cirurgica(dias): return 6 if 0 < dias < 5 else (4 if 5 <= dias
 def pontuacao_uti(taxa): return 6 if taxa >= 85 else (4 if taxa >= 70 else (2 if taxa >= 60 else 0))
 def pontuacao_infeccao(densidade): return 6 if densidade <= 2.0 else (4 if densidade <= 3.0 else (2 if densidade <= 5.0 else 0))
 
+# ===================== OTIMIZADOR DE MEMÓRIA DE DATAFRAMES =====================
+COLUNAS_ESSENCIAIS = {
+    'CNES', 'CNES_EXEC', 'CODUFMUN', 'SP_CNES', 'MORTE', 'OBITO', 'DIAG_OBITO',
+    'DIAS_PERM', 'QT_DIARIAS', 'DIAS', 'ESPEC', 'COD_ESPEC', 'ESPECIAL',
+    'COBRANCA', 'MOT_SAIDA', 'COBRA_SAI', 'MOTIV_SAI', 'SP_GESTOR', 'SP_UF',
+    'SP_AA', 'SP_MM', 'SP_NAIH', 'SP_PROCREA', 'SP_DTINTER', 'SP_DTSAIDA',
+    'SP_NUM_PR', 'SP_TIPO', 'SP_CPFCGC', 'SP_ATOPROF', 'SP_TP_ATO', 'SP_QTD_ATO',
+    'SP_PROCDIG', 'SP_COD_ATO', 'SP_ATO', 'ATOPROF', 'PROCDIG', 'COD_ATO',
+    'PROCEDIMENTO', 'SP_QT_ATO', 'SP_QTD', 'QT_ATO', 'QTD_ATO', 'QT_PROCDIG',
+    'QUANTIDADE', 'SP_VALATO', 'SP_VAL_ATO', 'SP_VALOR', 'VAL_ATO', 'VALOR_ATO',
+    'VAL_PROCDIG', 'VAL_TOT', 'SP_IDADE', 'IDADE', 'NU_IDADE', 'IDADE_PAC',
+    'UF_ZI', 'ANO_CMPT', 'MES_CMPT', 'CGC_HOSP', 'N_AIH', 'IDENT', 'CEP', 'MUNIC_RES'
+}
+
+def otimizar_dataframe_memoria(df):
+    if df is None or df.empty:
+        return df
+    try:
+        cols_upper_map = {str(c).upper().strip(): c for c in df.columns}
+        manter_cols = [cols_upper_map[k] for k in cols_upper_map if k in COLUNAS_ESSENCIAIS]
+        if manter_cols:
+            df = df[manter_cols]
+    except Exception:
+        pass
+    gc.collect()
+    return df
+
 # ===================== CONVERSOR UNIVERSAL PYSUS =====================
 def converter_pysus_para_dataframe(res):
     if res is None:
         return None
     if isinstance(res, pd.DataFrame):
-        return res if not res.empty else None
+        return otimizar_dataframe_memoria(res) if not res.empty else None
     
     if isinstance(res, (list, tuple)):
         dfs = []
@@ -207,7 +234,7 @@ def converter_pysus_para_dataframe(res):
             if sub_df is not None and not sub_df.empty:
                 dfs.append(sub_df)
         if dfs:
-            return pd.concat(dfs, ignore_index=True)
+            return otimizar_dataframe_memoria(pd.concat(dfs, ignore_index=True))
         return None
     
     if isinstance(res, str):
@@ -215,26 +242,28 @@ def converter_pysus_para_dataframe(res):
             if res.upper().endswith('.DBC'):
                 df = ler_arquivo_dbc(res)
                 if df is not None:
-                    return df
+                    return otimizar_dataframe_memoria(df)
             try:
-                return pd.read_parquet(res)
+                df = pd.read_parquet(res)
+                return otimizar_dataframe_memoria(df)
             except Exception:
                 pass
             if parquets_to_dataframe is not None:
                 try:
-                    return parquets_to_dataframe([res])
+                    df = parquets_to_dataframe([res])
+                    return otimizar_dataframe_memoria(df)
                 except Exception:
                     pass
     
     if hasattr(res, 'to_dataframe'):
         try:
-            return res.to_dataframe()
+            return otimizar_dataframe_memoria(res.to_dataframe())
         except Exception:
             pass
             
     if hasattr(res, 'load'):
         try:
-            return res.load()
+            return otimizar_dataframe_memoria(res.load())
         except Exception:
             pass
 
