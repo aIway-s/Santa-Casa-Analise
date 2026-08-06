@@ -127,7 +127,7 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
                         d["saidas_cir"] = len(df_cir_saidas)
 
     except Exception as e: 
-        print(f"Erro no processamento de RD ({month}/{year}): {e}")
+        st.error(f"Erro no processamento de RD ({month}/{year}): {e}")
 
     # ------------------- 2. SP (UTIs) -------------------
     try:
@@ -168,7 +168,7 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
                         d["dias_p"] = df_ok[mask_p].groupby([c_aih, c_ato])[c_qtd].sum().sum()
 
     except Exception as e: 
-        print(f"Erro no processamento de SP ({month}/{year}): {e}")
+        st.error(f"Erro no processamento de SP ({month}/{year}): {e}")
 
     d.update({"cap_geral": caps['geral'], "cap_a": caps['uti_a'], "cap_n": caps['uti_n'], "cap_p": caps['uti_p']})
     return d
