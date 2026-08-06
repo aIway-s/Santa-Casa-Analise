@@ -4,3 +4,5 @@ matplotlib
 numpy
 loguru
 pysus==2.7.0
+pyarrow
+fastparquet
