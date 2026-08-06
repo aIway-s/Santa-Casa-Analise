@@ -63,9 +63,41 @@ for mod_path in modules_to_check:
 def ler_arquivo_dbc(filepath):
     if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
         return None
-        
-    # 1. Tentar via read_dbc (pyreaddbc ou PySUS)
-    if read_dbc is not None:
+
+    temp_dbf = tempfile.mktemp(suffix=".dbf")
+    descompactado = False
+
+    # 1. Tentar via datasus-dbc (Motor em Rust: rápido e sem dependências de compilação C)
+    try:
+        import datasus_dbc
+        datasus_dbc.decompress(filepath, temp_dbf)
+        if os.path.exists(temp_dbf) and os.path.getsize(temp_dbf) > 0:
+            descompactado = True
+    except Exception:
+        pass
+
+    # 2. Tentar via dbc-to-dbf (Descompactador PKWARE 100% em Python puro)
+    if not descompactado:
+        try:
+            from dbctodbf import DBCDecompress  # type: ignore
+            dbc = DBCDecompress()
+            dbc.decompressFile(filepath, temp_dbf)
+            if os.path.exists(temp_dbf) and os.path.getsize(temp_dbf) > 0:
+                descompactado = True
+        except Exception:
+            pass
+
+    # 3. Tentar via dbc2dbf do PySUS
+    if not descompactado and dbc2dbf is not None:
+        try:
+            dbc2dbf(filepath, temp_dbf)
+            if os.path.exists(temp_dbf) and os.path.getsize(temp_dbf) > 0:
+                descompactado = True
+        except Exception:
+            pass
+
+    # 4. Tentar via read_dbc direto
+    if not descompactado and read_dbc is not None:
         try:
             df = read_dbc(filepath)
             if df is not None and not df.empty:
@@ -73,25 +105,26 @@ def ler_arquivo_dbc(filepath):
         except Exception:
             pass
 
-    # 2. Tentar via dbc2dbf + dbfread
-    if dbc2dbf is not None:
+    # Se descompactou com sucesso para DBF, converter em DataFrame via dbfread
+    if descompactado and os.path.exists(temp_dbf):
         try:
-            temp_dbf = filepath.replace('.DBC', '.dbf').replace('.dbc', '.dbf')
-            dbc2dbf(filepath, temp_dbf)
+            from dbfread import DBF  # type: ignore
+            table = DBF(temp_dbf, encoding='iso-8859-1', ignore_missing_memofile=True)
+            df = pd.DataFrame(iter(table))
+            try:
+                os.remove(temp_dbf)
+            except Exception:
+                pass
+            if df is not None and not df.empty:
+                return df
+        except Exception:
             if os.path.exists(temp_dbf):
                 try:
-                    from dbfread import DBF  # type: ignore
-                    table = DBF(temp_dbf, encoding='iso-8859-1')
-                    df = pd.DataFrame(iter(table))
-                    if os.path.exists(temp_dbf):
-                        os.remove(temp_dbf)
-                    return df
+                    os.remove(temp_dbf)
                 except Exception:
                     pass
-        except Exception:
-            pass
 
-    # 3. Tentar ler direto via pandas/pyarrow se por acaso for parquet disfarçado
+    # 5. Fallback: verificar se é Parquet disfarçado
     try:
         return pd.read_parquet(filepath)
     except Exception:
