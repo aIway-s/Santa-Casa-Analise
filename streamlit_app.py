@@ -6,8 +6,23 @@ import calendar
 import io
 import traceback
 
-# Import exclusivo da API moderna do PySUS
-from pysus import sih
+# Importações resilientes do PySUS (compatíveis com PySUS v1.x e v2.x modern API)
+sih_api = None
+try:
+    from pysus import sih as sih_api
+except ImportError:
+    try:
+        from pysus.api import sih as sih_api
+    except ImportError:
+        sih_api = None
+
+sih_download = None
+parquets_to_dataframe = None
+try:
+    from pysus.online_data.SIH import download as sih_download
+    from pysus.online_data import parquets_to_dataframe
+except ImportError:
+    pass
 
 # ===================== CONFIGURAÇÃO =====================
 st.set_page_config(page_title="Indicadores - Santa Casa", layout="wide")
@@ -34,7 +49,8 @@ def get_meses_quadrimestre(q):
     return []
 
 def encontrar_coluna(df, candidatos):
-    cols_upper = [c.upper().strip() for c in df.columns]
+    if df is None or df.empty: return None
+    cols_upper = [str(c).upper().strip() for c in df.columns]
     for termo in candidatos:
         for i, col in enumerate(cols_upper):
             if termo == col: return df.columns[i]
@@ -46,7 +62,7 @@ def encontrar_coluna(df, candidatos):
 def get_days_in_month(year, month):
     return calendar.monthrange(year, month)[1]
 
-# --- PONTUAÇÃO ---
+# --- PONTUAÇÃO (REGRAS DE NEGÓCIO MANTIDAS) ---
 def pontuacao_mortalidade(taxa): return 7 if taxa <= 3 else (4 if taxa < 6 else (2 if taxa <= 8 else 0))
 def pontuacao_ocupacao(taxa): return 7 if taxa >= 80 else (4 if taxa >= 65 else (2 if taxa >= 55 else 0))
 def pontuacao_tmp_medica(dias): return 6 if 0 < dias < 8 else (4 if 8 <= dias < 11 else (2 if 11 <= dias < 14 else 0))
@@ -54,37 +70,64 @@ def pontuacao_tmp_cirurgica(dias): return 6 if 0 < dias < 5 else (4 if 5 <= dias
 def pontuacao_uti(taxa): return 6 if taxa >= 85 else (4 if taxa >= 70 else (2 if taxa >= 60 else 0))
 def pontuacao_infeccao(densidade): return 6 if densidade <= 2.0 else (4 if densidade <= 3.0 else (2 if densidade <= 5.0 else 0))
 
-# ===================== PROCESSAMENTO =====================
+# ===================== DOWNLOAD MULTI-VERSÃO PYSUS =====================
+def baixar_dados_sih(uf, year, month, group="RD"):
+    """
+    Baixa os microdados do SIH utilizando a API do PySUS com fallback automático 
+    entre a API moderna (PySUS 2.x) e o método clássico (download/parquets_to_dataframe).
+    """
+    # 1. Tentativa via API Moderna (PySUS 2.x+)
+    if sih_api is not None:
+        grupos_para_testar = [group, group.lower(), group.upper()]
+        for grp in grupos_para_testar:
+            try:
+                res = sih_api(state=uf, year=int(year), month=[int(month)], group=grp, as_dataframe=True)
+                if isinstance(res, pd.DataFrame) and not res.empty:
+                    return res
+            except Exception:
+                pass
+            try:
+                res = sih_api(state=uf, year=int(year), month=int(month), group=grp, as_dataframe=True)
+                if isinstance(res, pd.DataFrame) and not res.empty:
+                    return res
+            except Exception:
+                pass
+
+    # 2. Tentativa via API Clássica (PySUS 1.x / online_data)
+    if sih_download is not None and parquets_to_dataframe is not None:
+        try:
+            arquivos = sih_download(state=uf, year=int(year), month=int(month), group=group)
+            if arquivos:
+                df = parquets_to_dataframe(arquivos)
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    return df
+        except Exception:
+            pass
+
+    return pd.DataFrame()
+
+# ===================== PROCESSAMENTO COM CACHE =====================
+@st.cache_data(ttl=3600, show_spinner=False)
 def processar_mes_unico(ano, month, uf, cnes_filter):
-    year = ano
+    year = int(ano)
     dias_mes = get_days_in_month(year, month)
     caps = {k: v * dias_mes for k, v in CAPACIDADE_FIXA.items()}
     
     d = {k: 0 for k in ["saidas_tot", "obitos_tot", "dias_geral", "dias_med", "saidas_med",
                         "dias_cir", "saidas_cir", "dias_a", "dias_n", "dias_p"]}
     d["mes"] = month
+    cnes_alvo_str = str(cnes_filter).strip().zfill(7)
     
-    # ------------------- 1. RD (Lógica Mista) -------------------
-    df_rd = pd.DataFrame()
-    try:
-        # API moderna com inteiros em lista e as_dataframe=True
-        df_rd = sih(state=uf, year=year, month=[int(month)], group="RD", as_dataframe=True) 
-    except Exception as e:
-        st.error(f"Falha na API para RD ({month}/{year}): {e}")
-
-    with st.expander(f"🕵️ Log de Extração: RD - {month}/{year}", expanded=False):
-        if df_rd is None or df_rd.empty:
-            st.warning(f"O PySUS retornou VAZIO para RD no mês {month}/{year}. É possível que os dados ainda não estejam disponíveis na nuvem do DATASUS.")
-        else:
-            st.success(f"Sucesso! Baixadas {len(df_rd)} linhas.")
+    # ------------------- 1. RD (Lógica Mista - Hospitalizações) -------------------
+    df_rd = baixar_dados_sih(uf=uf, year=year, month=month, group="RD")
 
     if df_rd is not None and not df_rd.empty:
-        df_rd.columns = [c.upper().strip() for c in df_rd.columns]
+        df_rd.columns = [str(c).upper().strip() for c in df_rd.columns]
         
-        cnes_c = encontrar_coluna(df_rd, ["CNES", "CNES_EXEC"])
+        cnes_c = encontrar_coluna(df_rd, ["CNES", "CNES_EXEC", "CODUFMUN"])
         if cnes_c:
-            df_rd['CNES_INT'] = pd.to_numeric(df_rd[cnes_c], errors='coerce').fillna(0).astype(int)
-            df_rd = df_rd[df_rd['CNES_INT'] == int(cnes_filter)].copy()
+            cnes_col_str = df_rd[cnes_c].astype(str).str.replace(r"\D", "", regex=True).str.zfill(7)
+            df_rd = df_rd[cnes_col_str == cnes_alvo_str].copy()
             
             if not df_rd.empty:
                 c_morte = encontrar_coluna(df_rd, ["MORTE", "OBITO"])
@@ -99,49 +142,38 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
 
                 if c_morte and c_dias:
                     d["saidas_tot"] = len(df_rd)
-                    d["obitos_tot"] = df_rd[df_rd[c_morte] == 1].shape[0]
-                    d["dias_geral"] = df_rd[c_dias].sum()
+                    d["obitos_tot"] = int((df_rd[c_morte] == 1).sum())
+                    d["dias_geral"] = int(df_rd[c_dias].sum())
 
                 if c_espec and c_motivo:
                     df_rd['ESPEC_STR'] = df_rd[c_espec].astype(str).str.split('.').str[0].str.strip().str.zfill(2)
                     df_rd['MOTIVO_INT'] = pd.to_numeric(df_rd[c_motivo], errors='coerce').fillna(0).astype(int)
                     
                     df_med_dias = df_rd[df_rd['ESPEC_STR'].isin(CODIGOS_ESPEC['MEDICA'])]
-                    d["dias_med"] = df_med_dias[c_dias].sum()
+                    d["dias_med"] = int(df_med_dias[c_dias].sum())
                     df_med_saidas = df_med_dias[~df_med_dias['MOTIVO_INT'].isin(MOTIVOS_NAO_CONTAR_SAIDA)]
                     d["saidas_med"] = len(df_med_saidas)
                     
                     df_cir_dias = df_rd[df_rd['ESPEC_STR'].isin(CODIGOS_ESPEC['CIRURGICA'])]
-                    d["dias_cir"] = df_cir_dias[c_dias].sum()
+                    d["dias_cir"] = int(df_cir_dias[c_dias].sum())
                     df_cir_saidas = df_cir_dias[~df_cir_dias['MOTIVO_INT'].isin(MOTIVOS_NAO_CONTAR_SAIDA)]
                     d["saidas_cir"] = len(df_cir_saidas)
 
-    # ------------------- 2. SP (UTIs) -------------------
-    df_sp = pd.DataFrame()
-    try:
-        df_sp = sih(state=uf, year=year, month=[int(month)], group="SP", as_dataframe=True)
-    except Exception as e:
-        st.error(f"Falha na API para SP ({month}/{year}): {e}")
-
-    with st.expander(f"🕵️ Log de Extração: SP - {month}/{year}", expanded=False):
-        if df_sp is None or df_sp.empty:
-            st.warning(f"O PySUS retornou VAZIO para SP no mês {month}/{year}. É possível que os dados ainda não estejam disponíveis na nuvem do DATASUS.")
-        else:
-            st.success(f"Sucesso! Baixadas {len(df_sp)} linhas.")
+    # ------------------- 2. SP (Serviços Profissionais / UTIs) -------------------
+    df_sp = baixar_dados_sih(uf=uf, year=year, month=month, group="SP")
 
     if df_sp is not None and not df_sp.empty:
-        df_sp.columns = [c.upper().strip() for c in df_sp.columns]
+        df_sp.columns = [str(c).upper().strip() for c in df_sp.columns]
         
         cnes_s = encontrar_coluna(df_sp, ["CNES", "SP_CNES"])
         if cnes_s:
-            df_sp['CNES_INT'] = pd.to_numeric(df_sp[cnes_s], errors='coerce').fillna(0).astype(int)
-            df_sp = df_sp[df_sp['CNES_INT'] == int(cnes_filter)].copy()
+            cnes_sp_str = df_sp[cnes_s].astype(str).str.replace(r"\D", "", regex=True).str.zfill(7)
+            df_sp = df_sp[cnes_sp_str == cnes_alvo_str].copy()
             
             if not df_sp.empty:
                 c_ato = next((c for c in df_sp.columns if "ATOPROF" in c), "SP_ATOPROF")
                 c_qtd = next((c for c in df_sp.columns if "QT_" in c), "SP_QTD_ATO")
                 c_val = next((c for c in df_sp.columns if "VAL" in c), "SP_VALATO")
-                c_aih = next((c for c in df_sp.columns if "NAIH" in c), "SP_NAIH")
                 c_idade = next((c for c in df_sp.columns if "IDADE" in c or "NU_IDADE" in c), None)
 
                 df_sp[c_ato] = df_sp[c_ato].astype(str).str.strip().str.replace(r"[^0-9]", "", regex=True)
@@ -158,9 +190,9 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
                     mask_n = (df_ok[c_ato] == '0802010121') & ((df_ok['IDADE_R'] < 1) | (df_ok['IDADE_R'] == -1))
                     mask_p = (df_ok[c_ato] == '0802010156')
 
-                    d["dias_a"] = df_ok[mask_a].groupby([c_aih, c_ato])[c_qtd].sum().sum()
-                    d["dias_n"] = df_ok[mask_n].groupby([c_aih, c_ato])[c_qtd].sum().sum()
-                    d["dias_p"] = df_ok[mask_p].groupby([c_aih, c_ato])[c_qtd].sum().sum()
+                    d["dias_a"] = int(df_ok.loc[mask_a, c_qtd].sum()) if mask_a.any() else 0
+                    d["dias_n"] = int(df_ok.loc[mask_n, c_qtd].sum()) if mask_n.any() else 0
+                    d["dias_p"] = int(df_ok.loc[mask_p, c_qtd].sum()) if mask_p.any() else 0
 
     d.update({"cap_geral": caps['geral'], "cap_a": caps['uti_a'], "cap_n": caps['uti_n'], "cap_p": caps['uti_p']})
     return d
@@ -170,7 +202,7 @@ def plot_indicador(ax, df, col_y, media, title, color_ok):
     x = df["periodo"]
     y = df[col_y].fillna(0)
     ax.bar(x, y, color=color_ok, alpha=0.8)
-    ax.set_title(f"{title}\nMedia: {media:.2f}", fontweight='bold', fontsize=10)
+    ax.set_title(f"{title}\nMédia: {media:.2f}", fontweight='bold', fontsize=10)
     ax.grid(axis='y', linestyle='--', alpha=0.3)
     ax.axhline(media, color='blue', linestyle='--')
     for i, val in enumerate(y):
@@ -183,9 +215,9 @@ def gerar_pdf_buffer(df, cnes, t):
         fig1, axs1 = plt.subplots(2, 2, figsize=FIG_SIZE)
         plt.suptitle(f"Indicadores Gerais - CNES {cnes}", fontsize=16, fontweight='bold')
         plot_indicador(axs1[0,0], df, "tx_mort_m", t['tx_mort'], "Mortalidade", "#2a9d8f")
-        plot_indicador(axs1[0,1], df, "tx_ocup_m", t['tx_ocup'], "Ocupacao Geral", "#2a9d8f")
-        plot_indicador(axs1[1,0], df, "tmp_med_m", t['tx_med'], "TMP Medica", "#2a9d8f")
-        plot_indicador(axs1[1,1], df, "tmp_cir_m", t['tx_cir'], "TMP Cirurgica", "#2a9d8f")
+        plot_indicador(axs1[0,1], df, "tx_ocup_m", t['tx_ocup'], "Ocupação Geral", "#2a9d8f")
+        plot_indicador(axs1[1,0], df, "tmp_med_m", t['tx_med'], "TMP Médica", "#2a9d8f")
+        plot_indicador(axs1[1,1], df, "tmp_cir_m", t['tx_cir'], "TMP Cirúrgica", "#2a9d8f")
         pdf.savefig(fig1); plt.close()
         
         fig2, axs2 = plt.subplots(2, 2, figsize=FIG_SIZE)
@@ -193,7 +225,7 @@ def gerar_pdf_buffer(df, cnes, t):
         plot_indicador(axs2[0,0], df, "tx_a_m", t['tx_a'], "UTI Adulto", "#2a9d8f")
         plot_indicador(axs2[0,1], df, "tx_n_m", t['tx_n'], "UTI Neo", "#2a9d8f")
         plot_indicador(axs2[1,0], df, "tx_p_m", t['tx_p'], "UTI Ped", "#2a9d8f")
-        plot_indicador(axs2[1,1], df, "dens_inf_m", t['tx_inf'], "Infeccao CVC", "#2a9d8f")
+        plot_indicador(axs2[1,1], df, "dens_inf_m", t['tx_inf'], "Infecção CVC", "#2a9d8f")
         pdf.savefig(fig2); plt.close()
         
         fig3 = plt.figure(figsize=FIG_SIZE)
@@ -203,12 +235,12 @@ def gerar_pdf_buffer(df, cnes, t):
             ["INDICADOR", "DADOS (Soma)", "RESULTADO", "NOTA"],
             ["Mortalidade", f"{t['s_obitos']}/{t['s_saidas']}", f"{t['tx_mort']:.2f}%", f"{t['p_mort']}/7"],
             ["Ocup. Geral", f"{t['s_dias_g']}/{t['s_cap_g']}", f"{t['tx_ocup']:.2f}%", f"{t['p_ocup']}/7"],
-            ["TMP Medica", f"{t['s_dias_m']}/{t['s_sai_m']}", f"{t['tx_med']:.2f} d", f"{t['p_med']}/6"],
-            ["TMP Cirurgica", f"{t['s_dias_c']}/{t['s_sai_c']}", f"{t['tx_cir']:.2f} d", f"{t['p_cir']}/6"],
+            ["TMP Médica", f"{t['s_dias_m']}/{t['s_sai_m']}", f"{t['tx_med']:.2f} d", f"{t['p_med']}/6"],
+            ["TMP Cirúrgica", f"{t['s_dias_c']}/{t['s_sai_c']}", f"{t['tx_cir']:.2f} d", f"{t['p_cir']}/6"],
             ["UTI Adulto", f"{t['s_dias_a']}/{t['s_cap_a']}", f"{t['tx_a']:.2f}%", f"{t['p_a']}/6"],
             ["UTI Neo", f"{t['s_dias_n']}/{t['s_cap_n']}", f"{t['tx_n']:.2f}%", f"{t['p_n']}/6"],
             ["UTI Ped", f"{t['s_dias_p']}/{t['s_cap_p']}", f"{t['tx_p']:.2f}%", f"{t['p_p']}/6"],
-            ["Infeccao", f"{t['s_casos']}/{t['s_cvc']}", f"{t['tx_inf']:.2f}‰", f"{t['p_inf']}/6"],
+            ["Infecção", f"{t['s_casos']}/{t['s_cvc']}", f"{t['tx_inf']:.2f}‰", f"{t['p_inf']}/6"],
             ["TOTAL", "", "", f"{t['total_pts']:.2f}/50"]
         ]
         tab = plt.table(cellText=dt, colLabels=None, loc='center', bbox=[0.05, 0.2, 0.9, 0.6])
@@ -216,6 +248,7 @@ def gerar_pdf_buffer(df, cnes, t):
         pdf.savefig(fig3); plt.close()
     buffer.seek(0); return buffer
 
+# ===================== INTERFACE (SIDEBAR) =====================
 with st.sidebar:
     st.header("Configurações")
     cnes_input = st.text_input("CNES", "2142376")
@@ -224,21 +257,25 @@ with st.sidebar:
     quad_sel = st.selectbox("Quadrimestre", ["Q1 (Jan-Abr)", "Q2 (Mai-Ago)", "Q3 (Set-Dez)"], index=1)
     meses_sel = get_meses_quadrimestre(quad_sel)
     
-    st.markdown("### Indicador 8 (Manual)")
+    st.markdown("### Indicador 8 (Manual CCIH)")
     manual = []
     with st.expander("Dados CCIH", expanded=False):
         for m in meses_sel:
             c = st.number_input(f"Casos {m:02d}", 0, 100, 0, key=f"c_{m}")
             d = st.number_input(f"Dias CVC {m:02d}", 0, 5000, 0, key=f"d_{m}")
-            manual.append((ano_sel, m, c, d))
-    if st.button("Limpar Cache"): st.cache_data.clear()
+            manual.append({"mes": m, "casos": c, "cvc": d})
+    
+    if st.button("Limpar Cache de Dados"): 
+        st.cache_data.clear()
+        st.success("Cache limpo com sucesso!")
 
+# ===================== PROCESSAMENTO PRINCIPAL =====================
 if st.button("Processar Dados", type="primary"):
     bar = st.progress(0); status = st.empty()
     res = []
     
     for i, m in enumerate(meses_sel):
-        status.text(f"Processando {m:02d}/{ano_sel}...")
+        status.text(f"Baixando/Processando {m:02d}/{ano_sel} via PySUS...")
         r = processar_mes_unico(ano_sel, m, uf_input, cnes_input)
         res.append(r)
         bar.progress((i+1)/len(meses_sel))
@@ -248,7 +285,7 @@ if st.button("Processar Dados", type="primary"):
     df = pd.DataFrame(res)
     df["periodo"] = df["mes"].apply(lambda x: f"{x:02d}")
     
-    man = pd.DataFrame(manual, columns=["ano", "mes", "casos", "cvc"])
+    man = pd.DataFrame(manual)
     df = pd.merge(df, man, on="mes", how="left")
     
     df["tx_mort_m"] = (df["obitos_tot"]/df["saidas_tot"]*100).fillna(0)
@@ -289,34 +326,34 @@ if st.button("Processar Dados", type="primary"):
     t['p_inf'] = pontuacao_infeccao(t['tx_inf'])
     t['total_pts'] = t['p_mort'] + t['p_ocup'] + t['p_med'] + t['p_cir'] + t['p_a'] + t['p_n'] + t['p_p'] + t['p_inf']
 
-    status.success("Concluído!")
+    status.success("Concluído com sucesso!")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Pontuação", f"{t['total_pts']} / 50")
+    c1.metric("Pontuação Total", f"{t['total_pts']} / 50")
     c2.metric("Mortalidade", f"{t['tx_mort']:.2f}%", f"Nota {t['p_mort']}")
-    c3.metric("Ocup. Geral", f"{t['tx_ocup']:.2f}%", f"Nota {t['p_ocup']}")
+    c3.metric("Ocupação Geral", f"{t['tx_ocup']:.2f}%", f"Nota {t['p_ocup']}")
     c4.metric("Infecção", f"{t['tx_inf']:.2f}‰", f"Nota {t['p_inf']}")
     
     c5, c6, c7, c8 = st.columns(4)
-    c5.metric("UTI Adu", f"{t['tx_a']:.2f}%", f"Nota {t['p_a']}")
+    c5.metric("UTI Adulto", f"{t['tx_a']:.2f}%", f"Nota {t['p_a']}")
     c6.metric("UTI Neo", f"{t['tx_n']:.2f}%", f"Nota {t['p_n']}")
     c7.metric("UTI Ped", f"{t['tx_p']:.2f}%", f"Nota {t['p_p']}")
-    c8.metric("TMP Med", f"{t['tx_med']:.2f}d", f"Nota {t['p_med']}")
+    c8.metric("TMP Médica", f"{t['tx_med']:.2f}d", f"Nota {t['p_med']}")
 
-    tab1, tab2, tab3 = st.tabs(["Graficos", "Tabela", "PDF"])
+    tab1, tab2, tab3 = st.tabs(["Gráficos", "Tabela", "PDF"])
     with tab1:
         c1, c2 = st.columns(2)
         fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tx_mort_m", t['tx_mort'], "Mortalidade", "#2a9d8f"); c1.pyplot(fig)
-        fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tx_ocup_m", t['tx_ocup'], "Ocupacao Geral", "#2a9d8f"); c2.pyplot(fig)
+        fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tx_ocup_m", t['tx_ocup'], "Ocupação Geral", "#2a9d8f"); c2.pyplot(fig)
         c3, c4 = st.columns(2)
-        fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tmp_med_m", t['tx_med'], "TMP Medica", "#2a9d8f"); c3.pyplot(fig)
-        fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tmp_cir_m", t['tx_cir'], "TMP Cirurgica", "#2a9d8f"); c4.pyplot(fig)
+        fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tmp_med_m", t['tx_med'], "TMP Médica", "#2a9d8f"); c3.pyplot(fig)
+        fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tmp_cir_m", t['tx_cir'], "TMP Cirúrgica", "#2a9d8f"); c4.pyplot(fig)
         st.markdown("### UTIs")
         c5, c6 = st.columns(2)
         fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tx_a_m", t['tx_a'], "UTI Adulto", "#2a9d8f"); c5.pyplot(fig)
         fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tx_n_m", t['tx_n'], "UTI Neo", "#2a9d8f"); c6.pyplot(fig)
         c7, c8 = st.columns(2)
         fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "tx_p_m", t['tx_p'], "UTI Ped", "#2a9d8f"); c7.pyplot(fig)
-        fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "dens_inf_m", t['tx_inf'], "Infeccao CVC", "#2a9d8f"); c8.pyplot(fig)
+        fig, ax = plt.subplots(figsize=(6,4)); plot_indicador(ax, df, "dens_inf_m", t['tx_inf'], "Infecção CVC", "#2a9d8f"); c8.pyplot(fig)
     
     with tab2: st.dataframe(df)
     with tab3:
