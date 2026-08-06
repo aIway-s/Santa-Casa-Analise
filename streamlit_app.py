@@ -4,10 +4,11 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import calendar
 import io
-import traceback # Para capturar o log completo do erro
+import traceback
 
-# Import do PySUS 2.7.0+
+# Importa a API nova e a clássica via FTP como plano B
 from pysus import sih
+from pysus.online_data.SIH import download as baixar_sih_ftp
 
 # ===================== CONFIGURAÇÃO =====================
 st.set_page_config(page_title="Indicadores - Santa Casa", layout="wide")
@@ -54,8 +55,7 @@ def pontuacao_tmp_cirurgica(dias): return 6 if 0 < dias < 5 else (4 if 5 <= dias
 def pontuacao_uti(taxa): return 6 if taxa >= 85 else (4 if taxa >= 70 else (2 if taxa >= 60 else 0))
 def pontuacao_infeccao(densidade): return 6 if densidade <= 2.0 else (4 if densidade <= 3.0 else (2 if densidade <= 5.0 else 0))
 
-# ===================== PROCESSAMENTO (SEM CACHE PARA DEBUG) =====================
-# Removido o @st.cache_data temporariamente para garantir que os prints apareçam na tela
+# ===================== PROCESSAMENTO =====================
 def processar_mes_unico(ano, month, uf, cnes_filter):
     year = ano
     dias_mes = get_days_in_month(year, month)
@@ -66,124 +66,129 @@ def processar_mes_unico(ano, month, uf, cnes_filter):
     d["mes"] = month
     
     # ------------------- 1. RD (Lógica Mista) -------------------
+    df_rd = pd.DataFrame()
     try:
-        df_rd = sih(state=uf, year=year, month=f"{month:02d}", group="RD", as_dataframe=True)
+        # Tentativa 1: API Nova (DuckLake). Exige inteiros em formato de lista.
+        df_rd = sih(state=uf, year=year, month=[int(month)]) 
+    except Exception:
+        pass
+    
+    # Se a API nova falhar ou retornar vazio, aciona o Fallback do FTP
+    if df_rd is None or df_rd.empty:
+        try:
+            res_rd = baixar_sih_ftp(states=[uf], years=[year], months=[int(month)], groups=["RD"])
+            if isinstance(res_rd, (list, tuple)) and len(res_rd) > 0:
+                df_rd = pd.concat(res_rd, ignore_index=True)
+            elif not isinstance(res_rd, (list, tuple)):
+                df_rd = res_rd
+        except Exception as e:
+            st.error(f"Falha no FTP para RD ({month}/{year}): {e}")
+
+    with st.expander(f"🕵️ Log de Extração: RD - {month}/{year}", expanded=False):
+        if df_rd is None or df_rd.empty:
+            st.warning("Ambas as APIs retornaram VAZIO para RD.")
+        else:
+            st.success(f"Sucesso! Baixadas {len(df_rd)} linhas.")
+
+    if df_rd is not None and not df_rd.empty:
+        df_rd.columns = [c.upper().strip() for c in df_rd.columns]
         
-        # DEBUG NA TELA: O que o PySUS retornou de verdade?
-        with st.expander(f"🕵️ Log de Extração: RD - {month}/{year}", expanded=True):
-            if df_rd is None:
-                st.error("PySUS retornou NONE. Arquivo pode não existir no FTP.")
-            elif df_rd.empty:
-                st.warning("PySUS retornou um DataFrame VAZIO (0 linhas).")
-            else:
-                st.success(f"Sucesso! Baixadas {len(df_rd)} linhas.")
-                st.write("Amostra dos Dados Brutos:")
-                st.dataframe(df_rd.head(3))
-                
-        if df_rd is not None and not df_rd.empty:
-            df_rd.columns = [c.upper().strip() for c in df_rd.columns]
+        cnes_c = encontrar_coluna(df_rd, ["CNES", "CNES_EXEC"])
+        if cnes_c:
+            df_rd['CNES_INT'] = pd.to_numeric(df_rd[cnes_c], errors='coerce').fillna(0).astype(int)
+            df_rd = df_rd[df_rd['CNES_INT'] == int(cnes_filter)].copy()
             
-            cnes_c = encontrar_coluna(df_rd, ["CNES", "CNES_EXEC"])
-            if cnes_c:
-                df_rd['CNES_INT'] = pd.to_numeric(df_rd[cnes_c], errors='coerce').fillna(0).astype(int)
-                df_rd = df_rd[df_rd['CNES_INT'] == int(cnes_filter)].copy()
-                
-                if not df_rd.empty:
-                    c_morte = encontrar_coluna(df_rd, ["MORTE", "OBITO"])
-                    c_dias = encontrar_coluna(df_rd, ["DIAS_PERM", "QT_DIARIAS"])
-                    c_espec = encontrar_coluna(df_rd, ["ESPEC", "COD_ESPEC"])
-                    c_motivo = encontrar_coluna(df_rd, ["COBRANCA", "MOT_SAIDA", "COBRA_SAI"])
+            if not df_rd.empty:
+                c_morte = encontrar_coluna(df_rd, ["MORTE", "OBITO"])
+                c_dias = encontrar_coluna(df_rd, ["DIAS_PERM", "QT_DIARIAS"])
+                c_espec = encontrar_coluna(df_rd, ["ESPEC", "COD_ESPEC"])
+                c_motivo = encontrar_coluna(df_rd, ["COBRANCA", "MOT_SAIDA", "COBRA_SAI"])
 
-                    if c_morte: df_rd[c_morte] = pd.to_numeric(df_rd[c_morte], errors='coerce').fillna(0).astype(int)
-                    if c_dias: df_rd[c_dias] = pd.to_numeric(df_rd[c_dias], errors='coerce').fillna(0).astype(int)
+                if c_morte: df_rd[c_morte] = pd.to_numeric(df_rd[c_morte], errors='coerce').fillna(0).astype(int)
+                if c_dias: df_rd[c_dias] = pd.to_numeric(df_rd[c_dias], errors='coerce').fillna(0).astype(int)
 
-                    df_rd = df_rd[df_rd[c_dias] >= 0].copy()
+                df_rd = df_rd[df_rd[c_dias] >= 0].copy()
 
-                    if c_morte and c_dias:
-                        d["saidas_tot"] = len(df_rd)
-                        d["obitos_tot"] = df_rd[df_rd[c_morte] == 1].shape[0]
-                        d["dias_geral"] = df_rd[c_dias].sum()
+                if c_morte and c_dias:
+                    d["saidas_tot"] = len(df_rd)
+                    d["obitos_tot"] = df_rd[df_rd[c_morte] == 1].shape[0]
+                    d["dias_geral"] = df_rd[c_dias].sum()
 
-                    if c_espec and c_motivo:
-                        df_rd['ESPEC_STR'] = df_rd[c_espec].astype(str).str.split('.').str[0].str.strip().str.zfill(2)
-                        df_rd['MOTIVO_INT'] = pd.to_numeric(df_rd[c_motivo], errors='coerce').fillna(0).astype(int)
-                        
-                        df_med_dias = df_rd[df_rd['ESPEC_STR'].isin(CODIGOS_ESPEC['MEDICA'])]
-                        d["dias_med"] = df_med_dias[c_dias].sum()
-                        df_med_saidas = df_med_dias[~df_med_dias['MOTIVO_INT'].isin(MOTIVOS_NAO_CONTAR_SAIDA)]
-                        d["saidas_med"] = len(df_med_saidas)
-                        
-                        df_cir_dias = df_rd[df_rd['ESPEC_STR'].isin(CODIGOS_ESPEC['CIRURGICA'])]
-                        d["dias_cir"] = df_cir_dias[c_dias].sum()
-                        df_cir_saidas = df_cir_dias[~df_cir_dias['MOTIVO_INT'].isin(MOTIVOS_NAO_CONTAR_SAIDA)]
-                        d["saidas_cir"] = len(df_cir_saidas)
-                else:
-                    st.warning(f"O CNES {cnes_filter} não foi encontrado dentro da base RD baixada em {month}/{year}.")
-
-    except Exception as e:
-        # Se quebrar, joga o log de erro inteiro na tela (traceback)
-        st.error(f"❌ Erro Crítico no processamento de RD ({month}/{year}): {e}")
-        st.code(traceback.format_exc())
+                if c_espec and c_motivo:
+                    df_rd['ESPEC_STR'] = df_rd[c_espec].astype(str).str.split('.').str[0].str.strip().str.zfill(2)
+                    df_rd['MOTIVO_INT'] = pd.to_numeric(df_rd[c_motivo], errors='coerce').fillna(0).astype(int)
+                    
+                    df_med_dias = df_rd[df_rd['ESPEC_STR'].isin(CODIGOS_ESPEC['MEDICA'])]
+                    d["dias_med"] = df_med_dias[c_dias].sum()
+                    df_med_saidas = df_med_dias[~df_med_dias['MOTIVO_INT'].isin(MOTIVOS_NAO_CONTAR_SAIDA)]
+                    d["saidas_med"] = len(df_med_saidas)
+                    
+                    df_cir_dias = df_rd[df_rd['ESPEC_STR'].isin(CODIGOS_ESPEC['CIRURGICA'])]
+                    d["dias_cir"] = df_cir_dias[c_dias].sum()
+                    df_cir_saidas = df_cir_dias[~df_cir_dias['MOTIVO_INT'].isin(MOTIVOS_NAO_CONTAR_SAIDA)]
+                    d["saidas_cir"] = len(df_cir_saidas)
 
     # ------------------- 2. SP (UTIs) -------------------
+    df_sp = pd.DataFrame()
     try:
-        df_sp = sih(state=uf, year=year, month=f"{month:02d}", group="SP", as_dataframe=True)
+        # A API simplificada pode não suportar filtros de grupo ainda, então caímos direto pro FTP se falhar
+        df_sp = sih(state=uf, year=year, month=[int(month)], group="SP")
+    except Exception:
+        pass
+
+    if df_sp is None or df_sp.empty:
+        try:
+            res_sp = baixar_sih_ftp(states=[uf], years=[year], months=[int(month)], groups=["SP"])
+            if isinstance(res_sp, (list, tuple)) and len(res_sp) > 0:
+                df_sp = pd.concat(res_sp, ignore_index=True)
+            elif not isinstance(res_sp, (list, tuple)):
+                df_sp = res_sp
+        except Exception as e:
+            st.error(f"Falha no FTP para SP ({month}/{year}): {e}")
+
+    with st.expander(f"🕵️ Log de Extração: SP - {month}/{year}", expanded=False):
+        if df_sp is None or df_sp.empty:
+            st.warning("Ambas as APIs retornaram VAZIO para SP.")
+        else:
+            st.success(f"Sucesso! Baixadas {len(df_sp)} linhas.")
+
+    if df_sp is not None and not df_sp.empty:
+        df_sp.columns = [c.upper().strip() for c in df_sp.columns]
         
-        # DEBUG NA TELA: O que o PySUS retornou de verdade?
-        with st.expander(f"🕵️ Log de Extração: SP - {month}/{year}", expanded=True):
-            if df_sp is None:
-                st.error("PySUS retornou NONE. Arquivo pode não existir no FTP.")
-            elif df_sp.empty:
-                st.warning("PySUS retornou um DataFrame VAZIO (0 linhas).")
-            else:
-                st.success(f"Sucesso! Baixadas {len(df_sp)} linhas.")
-                st.write("Amostra dos Dados Brutos:")
-                st.dataframe(df_sp.head(3))
-                
-        if df_sp is not None and not df_sp.empty:
-            df_sp.columns = [c.upper().strip() for c in df_sp.columns]
+        cnes_s = encontrar_coluna(df_sp, ["CNES", "SP_CNES"])
+        if cnes_s:
+            df_sp['CNES_INT'] = pd.to_numeric(df_sp[cnes_s], errors='coerce').fillna(0).astype(int)
+            df_sp = df_sp[df_sp['CNES_INT'] == int(cnes_filter)].copy()
             
-            cnes_s = encontrar_coluna(df_sp, ["CNES", "SP_CNES"])
-            if cnes_s:
-                df_sp['CNES_INT'] = pd.to_numeric(df_sp[cnes_s], errors='coerce').fillna(0).astype(int)
-                df_sp = df_sp[df_sp['CNES_INT'] == int(cnes_filter)].copy()
+            if not df_sp.empty:
+                c_ato = next((c for c in df_sp.columns if "ATOPROF" in c), "SP_ATOPROF")
+                c_qtd = next((c for c in df_sp.columns if "QT_" in c), "SP_QTD_ATO")
+                c_val = next((c for c in df_sp.columns if "VAL" in c), "SP_VALATO")
+                c_aih = next((c for c in df_sp.columns if "NAIH" in c), "SP_NAIH")
+                c_idade = next((c for c in df_sp.columns if "IDADE" in c or "NU_IDADE" in c), None)
+
+                df_sp[c_ato] = df_sp[c_ato].astype(str).str.strip().str.replace(r"[^0-9]", "", regex=True)
+                df_sp[c_qtd] = pd.to_numeric(df_sp[c_qtd], errors='coerce').fillna(0).astype(int)
+                df_sp[c_val] = pd.to_numeric(df_sp[c_val], errors='coerce').fillna(0.0)
                 
-                if not df_sp.empty:
-                    c_ato = next((c for c in df_sp.columns if "ATOPROF" in c), "SP_ATOPROF")
-                    c_qtd = next((c for c in df_sp.columns if "QT_" in c), "SP_QTD_ATO")
-                    c_val = next((c for c in df_sp.columns if "VAL" in c), "SP_VALATO")
-                    c_aih = next((c for c in df_sp.columns if "NAIH" in c), "SP_NAIH")
-                    c_idade = next((c for c in df_sp.columns if "IDADE" in c or "NU_IDADE" in c), None)
+                if c_idade: df_sp['IDADE_R'] = pd.to_numeric(df_sp[c_idade], errors='coerce').fillna(-1)
+                else: df_sp['IDADE_R'] = -1
 
-                    df_sp[c_ato] = df_sp[c_ato].astype(str).str.strip().str.replace(r"[^0-9]", "", regex=True)
-                    df_sp[c_qtd] = pd.to_numeric(df_sp[c_qtd], errors='coerce').fillna(0).astype(int)
-                    df_sp[c_val] = pd.to_numeric(df_sp[c_val], errors='coerce').fillna(0.0)
-                    
-                    if c_idade: df_sp['IDADE_R'] = pd.to_numeric(df_sp[c_idade], errors='coerce').fillna(-1)
-                    else: df_sp['IDADE_R'] = -1
+                df_ok = df_sp[df_sp[c_val] > 0].copy()
+                
+                if not df_ok.empty:
+                    mask_a = (df_ok[c_ato] == '0802010083') & ((df_ok['IDADE_R'] >= 14) | (df_ok['IDADE_R'] == -1))
+                    mask_n = (df_ok[c_ato] == '0802010121') & ((df_ok['IDADE_R'] < 1) | (df_ok['IDADE_R'] == -1))
+                    mask_p = (df_ok[c_ato] == '0802010156')
 
-                    df_ok = df_sp[df_sp[c_val] > 0].copy()
-                    
-                    if not df_ok.empty:
-                        mask_a = (df_ok[c_ato] == '0802010083') & ((df_ok['IDADE_R'] >= 14) | (df_ok['IDADE_R'] == -1))
-                        mask_n = (df_ok[c_ato] == '0802010121') & ((df_ok['IDADE_R'] < 1) | (df_ok['IDADE_R'] == -1))
-                        mask_p = (df_ok[c_ato] == '0802010156')
-
-                        d["dias_a"] = df_ok[mask_a].groupby([c_aih, c_ato])[c_qtd].sum().sum()
-                        d["dias_n"] = df_ok[mask_n].groupby([c_aih, c_ato])[c_qtd].sum().sum()
-                        d["dias_p"] = df_ok[mask_p].groupby([c_aih, c_ato])[c_qtd].sum().sum()
-                else:
-                    st.warning(f"O CNES {cnes_filter} não foi encontrado dentro da base SP baixada em {month}/{year}.")
-
-    except Exception as e:
-        # Se quebrar, joga o log de erro inteiro na tela
-        st.error(f"❌ Erro Crítico no processamento de SP ({month}/{year}): {e}")
-        st.code(traceback.format_exc())
+                    d["dias_a"] = df_ok[mask_a].groupby([c_aih, c_ato])[c_qtd].sum().sum()
+                    d["dias_n"] = df_ok[mask_n].groupby([c_aih, c_ato])[c_qtd].sum().sum()
+                    d["dias_p"] = df_ok[mask_p].groupby([c_aih, c_ato])[c_qtd].sum().sum()
 
     d.update({"cap_geral": caps['geral'], "cap_a": caps['uti_a'], "cap_n": caps['uti_n'], "cap_p": caps['uti_p']})
     return d
 
-# ===================== PLOTAGEM =====================
+# ===================== PLOTAGEM E UI =====================
 def plot_indicador(ax, df, col_y, media, title, color_ok):
     x = df["periodo"]
     y = df[col_y].fillna(0)
@@ -234,7 +239,6 @@ def gerar_pdf_buffer(df, cnes, t):
         pdf.savefig(fig3); plt.close()
     buffer.seek(0); return buffer
 
-# ===================== UI =====================
 with st.sidebar:
     st.header("Configurações")
     cnes_input = st.text_input("CNES", "2142376")
@@ -270,7 +274,6 @@ if st.button("Processar Dados", type="primary"):
     man = pd.DataFrame(manual, columns=["ano", "mes", "casos", "cvc"])
     df = pd.merge(df, man, on="mes", how="left")
     
-    # Indicadores Mensais
     df["tx_mort_m"] = (df["obitos_tot"]/df["saidas_tot"]*100).fillna(0)
     df["tx_ocup_m"] = (df["dias_geral"]/df["cap_geral"]*100).clip(upper=100).fillna(0)
     df["tmp_med_m"] = (df["dias_med"]/df["saidas_med"]).fillna(0)
@@ -280,7 +283,6 @@ if st.button("Processar Dados", type="primary"):
     df["tx_p_m"] = (df["dias_p"]/df["cap_p"]*100).fillna(0)
     df["dens_inf_m"] = (df["casos"]/df["cvc"]*1000).fillna(0)
 
-    # Totais
     t = {}
     t['s_obitos'] = df['obitos_tot'].sum(); t['s_saidas'] = df['saidas_tot'].sum()
     t['s_dias_g'] = df['dias_geral'].sum(); t['s_cap_g'] = df['cap_geral'].sum()
@@ -291,7 +293,6 @@ if st.button("Processar Dados", type="primary"):
     t['s_dias_p'] = df['dias_p'].sum(); t['s_cap_p'] = df['cap_p'].sum()
     t['s_casos'] = df['casos'].sum(); t['s_cvc'] = df['cvc'].sum()
 
-    # Taxas
     t['tx_mort'] = (t['s_obitos']/t['s_saidas']*100) if t['s_saidas'] else 0
     t['tx_ocup'] = (t['s_dias_g']/t['s_cap_g']*100) if t['s_cap_g'] else 0
     t['tx_med'] = (t['s_dias_m']/t['s_sai_m']) if t['s_sai_m'] else 0
@@ -301,7 +302,6 @@ if st.button("Processar Dados", type="primary"):
     t['tx_p'] = (t['s_dias_p']/t['s_cap_p']*100) if t['s_cap_p'] else 0
     t['tx_inf'] = (t['s_casos']/t['s_cvc']*1000) if t['s_cvc'] else 0
 
-    # Pontos
     t['p_mort'] = pontuacao_mortalidade(t['tx_mort'])
     t['p_ocup'] = pontuacao_ocupacao(t['tx_ocup'])
     t['p_med'] = pontuacao_tmp_medica(t['tx_med'])
